@@ -1,0 +1,29 @@
+spec_version: 1
+name: intent
+description: Understands the artifact purpose, context, and how source material should
+  be used.
+executor:
+  type: omnigent
+  model: claude-opus-5
+  reasoning_effort: medium
+  fallbacks:
+  - model: claude-fable-5-1
+    reasoning_effort: medium
+    harness: claude-native
+  config:
+    harness: claude-native
+    permission_mode: bypassPermissions
+    yolo: false
+instructions: AGENTS.md
+skills: none
+guardrails:
+  policies:
+    supplied_material_only:
+      type: function
+      function:
+        path: omnigent.policies.function.make_fixed_action_callable
+        arguments:
+          action: deny
+          on_phases:
+          - tool_call
+          reason: This role reviews only the supplied material; tool calls are disabled.

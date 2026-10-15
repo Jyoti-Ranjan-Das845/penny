@@ -1,0 +1,4325 @@
+diff --git a/omnigent/_native_post_delivery.py b/omnigent/_native_post_delivery.py
+index 3ee215c8a..e511dc9aa 100644
+--- a/omnigent/_native_post_delivery.py
++++ b/omnigent/_native_post_delivery.py
+@@ -179,6 +179,8 @@ async def post_external_session_status(
+     background_task_count: int | None = None,
+     background_tasks: list[dict[str, object]] | None = None,
+     response_id: str | None = None,
++    native_failure: dict[str, object] | None = None,
++    native_source: dict[str, object] | None = None,
+ ) -> None:
+     """Post one ``external_session_status`` event to the Sessions API.
+ 
+@@ -219,6 +221,10 @@ async def post_external_session_status(
+         data["background_tasks"] = background_tasks
+     if response_id is not None:
+         data["response_id"] = response_id
++    if native_failure is not None:
++        data["native_failure"] = native_failure
++    if native_source is not None:
++        data["native_source"] = native_source
+     resp = await client.post(
+         f"/v1/sessions/{session_id}/events",
+         json={"type": "external_session_status", "data": data},
+diff --git a/omnigent/claude_native.py b/omnigent/claude_native.py
+index 9fc09ae37..d710ae65c 100644
+--- a/omnigent/claude_native.py
++++ b/omnigent/claude_native.py
+@@ -4812,6 +4812,7 @@ async def _ensure_local_claude_resume_transcript(
+     session_id: str,
+     external_session_id: str,
+     workspace: Path,
++    history_before_item_id: str | None = None,
+ ) -> Path | None:
+     """
+     Refresh Claude Code's local JSONL transcript for cold resume.
+@@ -4836,6 +4837,9 @@ async def _ensure_local_claude_resume_transcript(
+         ``OMNIGENT_RUNNER_WORKSPACE``. Pass an already-resolved
+         path (symlinks collapsed) so the project-dir encoding matches
+         what Claude computes.
++    :param history_before_item_id: Optional exclusive history boundary for a
++        recovered attempt. Requires exactly one matching committed item and
++        forbids falling back to an unbounded local transcript.
+     :returns: Path to the local transcript that was written; ``None`` if
+         *external_session_id* is not a safe transcript stem, or if the AP
+         history yields no resumable records (an empty transcript would make
+@@ -4843,6 +4847,7 @@ async def _ensure_local_claude_resume_transcript(
+         fresh).
+     :raises click.ClickException: If Omnigent history cannot be fetched or
+         the transcript cannot be written.
++    :raises ValueError: If a requested history boundary is missing or ambiguous.
+     """
+     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
+         return None
+@@ -4855,6 +4860,9 @@ async def _ensure_local_claude_resume_transcript(
+     try:
+         items = await _fetch_all_session_items_for_claude_resume(client, session_id)
+     except _ResumeHistoryUnavailableError:
++        if history_before_item_id is not None:
++            # A stale local file cannot prove the exclusive recovery boundary.
++            raise
+         # Server history is unreachable (5xx / dropped connections at every
+         # page size), but an intact local transcript from a previous run on
+         # this machine can still resume the conversation — far better than
+@@ -4871,6 +4879,15 @@ async def _ensure_local_claude_resume_transcript(
+             )
+             return target
+         raise
++    if history_before_item_id is not None:
++        boundaries = [
++            index for index, item in enumerate(items) if item.get("id") == history_before_item_id
++        ]
++        if len(boundaries) != 1:
++            raise ValueError("Recovery history boundary must identify exactly one committed item")
++        items = items[: boundaries[0]]
++        if not items:
++            return None
+     # Items are persisted with unresolved file_id attachment blocks;
+     # fetch the bytes back so the rebuilt transcript can reference a
+     # live local file instead of silently dropping the attachment.
+diff --git a/omnigent/claude_native_bridge.py b/omnigent/claude_native_bridge.py
+index c175170dd..46efd8941 100644
+--- a/omnigent/claude_native_bridge.py
++++ b/omnigent/claude_native_bridge.py
+@@ -587,6 +587,9 @@ class ClaudeHookRecord:
+     task_status: str | None = None
+     background_task_count: int = 0
+     background_tasks: list[_JsonObject] | None = None
++    error: str | None = None
++    error_details: str | None = None
++    last_assistant_message: str | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2890,6 +2893,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+     if isinstance(raw_event_name, str) and raw_event_name:
+         event_name = raw_event_name
+     raw_source = payload.get("source") if isinstance(payload, dict) else None
++    raw_error = payload.get("error") if isinstance(payload, dict) else None
++    raw_error_details = payload.get("error_details") if isinstance(payload, dict) else None
++    raw_last_message = payload.get("last_assistant_message") if isinstance(payload, dict) else None
+     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
+     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
+     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
+@@ -3015,6 +3021,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+         task_status=task_status,
+         background_task_count=background_task_count,
+         background_tasks=background_tasks,
++        error=raw_error if isinstance(raw_error, str) else None,
++        error_details=raw_error_details if isinstance(raw_error_details, str) else None,
++        last_assistant_message=raw_last_message if isinstance(raw_last_message, str) else None,
+     )
+ 
+ 
+diff --git a/omnigent/claude_native_forwarder.py b/omnigent/claude_native_forwarder.py
+index 2747e655d..38aae3494 100644
+--- a/omnigent/claude_native_forwarder.py
++++ b/omnigent/claude_native_forwarder.py
+@@ -49,6 +49,7 @@ from omnigent.claude_native_message_display_hook import MESSAGE_DELTAS_FILE
+ from omnigent.claude_native_status import sync_raw_status_context
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.model_metadata import concrete_reported_model
++from omnigent.native_failure_evidence import claude_failure_evidence
+ from omnigent.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+ 
+ _FORWARDER_STATE_FILE = "transcript_forwarder.json"
+@@ -3010,6 +3011,30 @@ async def _forward_available_status_events(
+                 # the UI can name the shells. Dropped on ``failed`` for the same
+                 # reason as the count (the server clears the tally there).
+                 background_tasks=(None if status == "failed" else record.background_tasks),
++                output=record.error_details if status == "failed" else None,
++                native_source=(
++                    {
++                        "harness": "claude-native",
++                        "external_session_id": record.claude_session_id,
++                        "turn_id": response_id,
++                    }
++                    if record.claude_session_id
++                    else None
++                ),
++                native_failure=(
++                    await asyncio.to_thread(
++                        claude_failure_evidence,
++                        error=record.error,
++                        transcript_path=record.transcript_path,
++                        external_session_id=record.claude_session_id,
++                        response_id=response_id,
++                        last_assistant_message=record.last_assistant_message,
++                        # A pre-work failure has no newly served model.
++                        # The sticky observation can belong to earlier history.
++                    )
++                    if status == "failed"
++                    else None
++                ),
+             )
+         except httpx.HTTPError as exc:
+             decision = retry_tracker.record_failure(retry_key, exc)
+@@ -4804,6 +4829,11 @@ async def _post_forwarder_failed_status(
+             status="failed",
+             output=reason,
+             response_id=response_id,
++            native_source={
++                "harness": "claude-native",
++                "external_session_id": read_claude_session_id(bridge_dir),
++                "turn_id": response_id,
++            },
+         )
+     except httpx.HTTPError:
+         _logger.warning(
+diff --git a/omnigent/codex_native.py b/omnigent/codex_native.py
+index 1bc552798..90b5000e2 100644
+--- a/omnigent/codex_native.py
++++ b/omnigent/codex_native.py
+@@ -1879,7 +1879,8 @@ async def _ensure_local_codex_resume_rollout(
+     model_provider: str,
+     codex_path: str | None,
+     terminal_launch_args: Sequence[str] | None = None,
+-) -> Path:
++    history_before_item_id: str | None = None,
++) -> Path | None:
+     """
+     Ensure Codex has a local rollout JSONL for cold resume.
+ 
+@@ -1913,7 +1914,13 @@ async def _ensure_local_codex_resume_rollout(
+         rollout, but treats the value as informational, so a flaky probe
+         must not cost the carried history.
+     :param terminal_launch_args: Persisted Codex approval/sandbox launch args.
+-    :returns: Path to the existing or written rollout.
++    :param history_before_item_id: Optional exclusive history boundary for a
++        recovered attempt. Requires exactly one matching committed item and a
++        fresh external session id, so the failed input is never replayed twice.
++    :returns: Path to the existing or written rollout; ``None`` when the bounded
++        history has no resumable records, so the caller must launch fresh.
++    :raises ValueError: If a requested history boundary is missing or ambiguous,
++        or an existing local rollout would bypass the boundary.
+     :raises click.ClickException: If Omnigent history cannot be fetched or the
+         rollout cannot be written, or if the persisted Codex thread id is
+         unsafe for use in a rollout filename.
+@@ -1925,9 +1932,20 @@ async def _ensure_local_codex_resume_rollout(
+         )
+     existing = _find_codex_rollout(codex_home, external_session_id)
+     if existing is not None:
++        if history_before_item_id is not None:
++            raise ValueError("Bounded Codex recovery requires a fresh external session id")
+         return existing
+     target = _codex_resume_rollout_path(codex_home, external_session_id)
+     items = await _fetch_all_session_items_for_codex_resume(client, session_id)
++    if history_before_item_id is not None:
++        boundaries = [
++            index for index, item in enumerate(items) if item.get("id") == history_before_item_id
++        ]
++        if len(boundaries) != 1:
++            raise ValueError("Recovery history boundary must identify exactly one committed item")
++        items = items[: boundaries[0]]
++        if not items:
++            return None
+     cli_version = None
+     if codex_path is not None:
+         from omnigent.inner.codex_executor import _codex_cli_version
+@@ -1944,6 +1962,10 @@ async def _ensure_local_codex_resume_rollout(
+         cli_version=cli_version or "0.0.0",
+         terminal_launch_args=terminal_launch_args,
+     )
++    if history_before_item_id is not None and not any(
++        record.get("type") in {"response_item", "compacted"} for record in records
++    ):
++        return None
+     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+     tmp = target.with_suffix(".jsonl.tmp")
+     try:
+diff --git a/omnigent/codex_native_forwarder.py b/omnigent/codex_native_forwarder.py
+index a31588e89..4cef1c167 100644
+--- a/omnigent/codex_native_forwarder.py
++++ b/omnigent/codex_native_forwarder.py
+@@ -59,6 +59,7 @@ from omnigent.codex_native_elicitation import (
+ )
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.json_types import JsonObject as _JsonObject
++from omnigent.native_failure_evidence import codex_availability_kind
+ 
+ _logger = logging.getLogger(__name__)
+ 
+@@ -447,6 +448,8 @@ class _CodexForwarderState:
+     # thread rotation), so a settled round stays settled and later items
+     # can skip re-reading the bridge file for the life of the session.
+     mcp_startup_settled: bool = False
++    fallback_observed_turn: str | None = None
++    fallback_work_seen: bool = False
+ 
+     def note_resume_response(self, response: CodexMessage) -> None:
+         """
+@@ -913,6 +916,7 @@ class _CodexTerminalError:
+ 
+     message: str
+     kind: str
++    availability_kind: str | None = None
+ 
+     @property
+     def is_auth(self) -> bool:
+@@ -1051,7 +1055,11 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
+     if payload is None:
+         return None
+     message = _error_payload_message(payload)
+-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
++    return _CodexTerminalError(
++        message=message,
++        kind=_classify_codex_error(payload, message),
++        availability_kind=codex_availability_kind(payload),
++    )
+ 
+ 
+ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
+@@ -1060,7 +1068,66 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
+     if not isinstance(payload, dict):
+         return None
+     message = _error_payload_message(payload)
+-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
++    return _CodexTerminalError(
++        message=message,
++        kind=_classify_codex_error(payload, message),
++        availability_kind=codex_availability_kind(payload),
++    )
++
++
++def _note_fallback_activity(method: str, params: _JsonObject, state: _CodexForwarderState) -> None:
++    """Record work before forwarding it; a reconnect never implies no work."""
++    turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
++    if method == "turn/started" and turn_id and turn_id != state.fallback_observed_turn:
++        state.fallback_observed_turn = turn_id
++        state.fallback_work_seen = False
++    if not turn_id or turn_id != state.fallback_observed_turn:
++        return
++    if method.startswith("item/"):
++        item = params.get("item")
++        if method in ("item/started", "item/completed") and isinstance(item, dict):
++            if item.get("type") in ("userMessage", "error"):
++                return
++        state.fallback_work_seen = True
++    elif method in ("turn/diff/updated", "turn/plan/updated"):
++        state.fallback_work_seen = True
++
++
++def _codex_failure_evidence(
++    params: _JsonObject,
++    error: _CodexTerminalError | None,
++    state: _CodexForwarderState | None,
++) -> _JsonObject | None:
++    """Authorize replay only for an identified turn with positive no-work evidence."""
++    if error is None or error.is_auth or error.availability_kind is None:
++        return None
++    turn_id = _turn_id_from_payload(params.get("turn")) or _turn_id_from_payload(params)
++    thread_id = _thread_id_from_params(params)
++    if not turn_id or not thread_id:
++        return None
++    observed = state is not None and state.fallback_observed_turn == turn_id
++    if observed and state is not None and state.fallback_work_seen:
++        return None
++    turn = params.get("turn")
++    items = turn.get("items") if isinstance(turn, dict) else None
++    if isinstance(items, list):
++        if any(
++            not isinstance(item, dict) or item.get("type") not in ("userMessage", "error")
++            for item in items
++        ):
++            return None
++    elif not observed:
++        return None
++    result: _JsonObject = {
++        "harness": "codex-native",
++        "turn_id": turn_id,
++        "external_session_id": thread_id,
++        "before_work": True,
++        "kind": error.availability_kind,
++    }
++    if state is not None and state.model:
++        result["model"] = state.model
++    return result
+ 
+ 
+ @dataclass(frozen=True)
+@@ -1082,6 +1149,7 @@ class _CodexTurnStatusEdge:
+     turn_id: str | None
+     source: str
+     error: _CodexTerminalError | None = None
++    external_session_id: str | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -2488,6 +2556,7 @@ def _resume_terminal_status_edge_for_latest_turn(
+             turn_id=turn_id,
+             source="thread/resume:turn-error" if error is not None else "thread/resume",
+             error=error,
++            external_session_id=state.thread_id,
+         )
+     return None
+ 
+@@ -2604,6 +2673,8 @@ async def _handle_event(
+     )
+     if route_session_id is None:
+         return
++    if not is_child and forwarder_state is not None:
++        _note_fallback_activity(method, params, forwarder_state)
+     # First model-produced item settles the synthesized MCP startup round
+     # mid-turn — codex defers turn execution until the round ends, so
+     # assistant-side output proves startup is over before the idle edge.
+@@ -3129,7 +3200,9 @@ async def _maybe_handle_turn_event(
+                 turn_id=turn_id,
+                 source="error",
+                 error=error,
++                external_session_id=_thread_id_from_params(params),
+             ),
++            native_failure=_codex_failure_evidence(params, error, forwarder_state),
+         )
+         await usage_coalescer.flush()
+         return True
+@@ -3390,7 +3463,12 @@ async def _handle_terminal_turn_boundary(
+     )
+     handled = terminal.handled
+     if terminal.edge is not None:
+-        await _post_turn_status_edge(client, session_id, terminal.edge)
++        await _post_turn_status_edge(
++            client,
++            session_id,
++            terminal.edge,
++            native_failure=_codex_failure_evidence(params, terminal.edge.error, forwarder_state),
++        )
+     if handled:
+         await elicitation_tracker.resolve_by_terminal_turn_event(
+             client,
+@@ -4282,6 +4360,7 @@ def _turn_started_status_edge(
+         status="running",
+         turn_id=turn_id,
+         source="turn/started",
++        external_session_id=_thread_id_from_params(params),
+     )
+ 
+ 
+@@ -4367,6 +4446,7 @@ def _terminal_turn_status_edge(
+             turn_id=terminal_turn_id,
+             source=f"{source}:turn-error",
+             error=error,
++            external_session_id=_thread_id_from_params(params),
+         )
+     if _turn_status_is_failed(params):
+         _logger.info(
+@@ -4378,6 +4458,7 @@ def _terminal_turn_status_edge(
+             status="failed",
+             turn_id=terminal_turn_id,
+             source=f"{source}:turn-failed",
++            external_session_id=_thread_id_from_params(params),
+         )
+     if method == "turn/completed" and _turn_items_are_empty(params):
+         _logger.warning(
+@@ -4390,6 +4471,7 @@ def _terminal_turn_status_edge(
+         status="idle" if method == "turn/completed" else "failed",
+         turn_id=terminal_turn_id,
+         source=source,
++        external_session_id=_thread_id_from_params(params),
+     )
+ 
+ 
+@@ -5999,6 +6081,8 @@ async def _post_status(
+     response_id: str | None = None,
+     output: str | None = None,
+     reauth_required: bool = False,
++    native_source: _JsonObject | None = None,
++    native_failure: _JsonObject | None = None,
+ ) -> None:
+     """
+     Publish a native Codex status edge.
+@@ -6023,6 +6107,10 @@ async def _post_status(
+         data["output"] = output
+     if reauth_required:
+         data["reauth_required"] = True
++    if native_failure is not None:
++        data["native_failure"] = native_failure
++    if native_source is not None:
++        data["native_source"] = native_source
+     response = await _post_session_event(
+         client,
+         session_id,
+@@ -6036,6 +6124,8 @@ async def _post_turn_status_edge(
+     client: httpx.AsyncClient,
+     session_id: str,
+     edge: _CodexTurnStatusEdge | None,
++    *,
++    native_failure: _JsonObject | None = None,
+ ) -> None:
+     """
+     Publish one Codex turn lifecycle edge if a valid edge was derived.
+@@ -6074,6 +6164,16 @@ async def _post_turn_status_edge(
+         response_id=response_id,
+         output=output,
+         reauth_required=reauth_required,
++        native_failure=native_failure,
++        native_source=(
++            {
++                "harness": "codex-native",
++                "external_session_id": edge.external_session_id,
++                "turn_id": edge.turn_id,
++            }
++            if edge.external_session_id
++            else None
++        ),
+     )
+ 
+ 
+@@ -7234,6 +7334,7 @@ def _delta_recovery_status_edge(
+         status="running",
+         turn_id=turn_id,
+         source="delta:recovered",
++        external_session_id=_thread_id_from_params(params),
+     )
+ 
+ 
+diff --git a/omnigent/inner/datamodel.py b/omnigent/inner/datamodel.py
+index 7af0f011c..847c50f65 100644
+--- a/omnigent/inner/datamodel.py
++++ b/omnigent/inner/datamodel.py
+@@ -336,6 +336,15 @@ class SessionState(enum.Enum):
+ # ---------------------------------------------------------------------------
+ 
+ 
++@dataclass(frozen=True)
++class ExecutorFallback:
++    """One explicitly authorized native model and harness backup."""
++
++    model: str
++    harness: str
++    reasoning_effort: str | None = None
++
++
+ @dataclass
+ class ExecutorSpec:
+     """Which executor/model to use.
+@@ -359,6 +368,7 @@ class ExecutorSpec:
+     harness: str | None = None
+     profile: str | None = None
+     auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
++    fallbacks: list[ExecutorFallback] = field(default_factory=list)
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/omnigent/inner/loader.py b/omnigent/inner/loader.py
+index 67f164f27..3b216076e 100644
+--- a/omnigent/inner/loader.py
++++ b/omnigent/inner/loader.py
+@@ -644,11 +644,14 @@ def _parse_executor_spec(data: YamlData | str | bool | None) -> ExecutorSpec | N
+             from omnigent.spec.parser import _parse_executor_auth
+ 
+             auth = _parse_executor_auth(data, expand_env=True)
++        from omnigent.spec.parser import _parse_executor_fallbacks
++
+         return ExecutorSpec(
+             model=data.get("model"),
+             harness=data.get("harness"),
+             profile=data.get("profile"),
+             auth=auth,
++            fallbacks=_parse_executor_fallbacks(data.get("fallbacks")),
+         )
+     return None
+ 
+diff --git a/omnigent/native_failure_evidence.py b/omnigent/native_failure_evidence.py
+new file mode 100644
+index 000000000..8960b9f5e
+--- /dev/null
++++ b/omnigent/native_failure_evidence.py
+@@ -0,0 +1,172 @@
++"""Conservative availability evidence for replaying a native turn before work."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from pathlib import Path
++
++
++def codex_availability_kind(error: dict[str, object]) -> str | None:
++    """Classify protocol errors without treating arbitrary failures as outages."""
++    info = error.get("codexErrorInfo")
++    variant = info if isinstance(info, str) else ""
++    status: object = None
++    if isinstance(info, dict):
++        variant = info.get("type") or info.get("kind") or info.get("variant") or ""
++        status = info.get("httpStatusCode")
++        if len(info) == 1 and not variant:
++            variant, detail = next(iter(info.items()))
++            if isinstance(detail, dict):
++                status = detail.get("httpStatusCode")
++    if status in (401, 403):
++        return None
++    if variant in ("usageLimitExceeded", "rateLimitExceeded") or status == 429:
++        return "rate_limit"
++    if variant in ("modelNotFound", "modelUnavailable"):
++        return "model_unavailable"
++    if variant in ("serverOverloaded", "serverUnavailable", "internalServerError") or status in (
++        500,
++        502,
++        503,
++        504,
++    ):
++        return "provider_unavailable"
++    return None
++
++
++def claude_failure_evidence(
++    *,
++    error: str | None,
++    transcript_path: Path | None,
++    external_session_id: str | None,
++    response_id: str | None,
++    last_assistant_message: str | None,
++    model: str | None = None,
++) -> dict[str, object] | None:
++    """Require the current user UUID and a complete transcript with no work."""
++    kind = {
++        "rate_limit": "rate_limit",
++        "overloaded": "provider_unavailable",
++        "model_not_found": "model_unavailable",
++        "server_error": "provider_unavailable",
++    }.get(error or "")
++    if kind is None or transcript_path is None or not external_session_id or not response_id:
++        return None
++    try:
++        # Bound memory use; a partial or oversized transcript cannot prove no work.
++        with transcript_path.open("rb") as stream:
++            raw = stream.read(16 * 1024 * 1024 + 1)
++        if len(raw) > 16 * 1024 * 1024 or not raw.endswith(b"\n"):
++            return None
++        rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
++    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
++        return None
++    if not rows or any(not isinstance(row, dict) for row in rows):
++        return None
++
++    # A normal user record resets the real forwarder's current_response_id.
++    # The first assistant record then establishes it from ITS UUID/requestId,
++    # rather than the user's UUID. Inspect the same user parsing semantics to
++    # reject command scaffolding, tool results, and compaction continuations.
++    from omnigent.claude_native_bridge import _user_transcript_items_from_entry
++
++    starts = []
++    for index, row in enumerate(rows):
++        if row.get("type") != "user" or row.get("isMeta") or row.get("isCompactSummary"):
++            continue
++        message = row.get("message")
++        if not isinstance(message, dict) or message.get("role") != "user":
++            return None
++        content = message.get("content")
++        if not isinstance(content, (str, list)):
++            return None
++        if isinstance(content, list):
++            if any(not isinstance(block, dict) for block in content):
++                return None
++            if any(block.get("type") == "tool_result" for block in content):
++                continue
++            if any(block.get("type") not in ("text", "image", "document") for block in content):
++                return None
++        next_response, items = _user_transcript_items_from_entry(
++            row,
++            line_number=index + 1,
++            record_offset=None,
++            agent_name="native-failure-evidence",
++            current_response_id=None,
++        )
++        if next_response is None and any(
++            item.item_type == "message"
++            and item.data.get("role") == "user"
++            and not item.data.get("is_meta")
++            for item in items
++        ):
++            starts.append(index)
++    if not starts:
++        return None
++    current = rows[starts[-1]]
++    user_id = current.get("uuid")
++    if (
++        not isinstance(user_id, str)
++        or not user_id
++        or current.get("sessionId") != external_session_id
++        or sum(row.get("uuid") == user_id for row in rows) != 1
++    ):
++        return None
++
++    error_texts: list[str] = []
++    first_error_source: str | None = None
++    ancestors = {user_id}
++    for row in rows[starts[-1] + 1 :]:
++        # Only explicit API-error messages and bookkeeping have no model work.
++        if row.get("type") == "assistant" and row.get("isApiErrorMessage") is True:
++            message = row.get("message")
++            content = message.get("content") if isinstance(message, dict) else None
++            if (
++                not isinstance(message, dict)
++                or message.get("role") != "assistant"
++                or row.get("sessionId") != external_session_id
++                or row.get("parentUuid") not in ancestors
++                or not isinstance(content, list)
++                or not content
++                or any(
++                    not isinstance(block, dict)
++                    or block.get("type") != "text"
++                    or not isinstance(block.get("text"), str)
++                    or not block["text"]
++                    for block in content
++                )
++            ):
++                return None
++            source = row.get("uuid") or row.get("requestId")
++            if not isinstance(source, str) or not source or source in ancestors:
++                return None
++            if first_error_source is None:
++                first_error_source = source
++            ancestors.add(source)
++            error_texts.append("\n".join(block["text"] for block in content))
++            continue
++        if row.get("type") in ("file-history-snapshot", "queue-operation"):
++            continue
++        return None
++
++    def response_for(source: str) -> str:
++        return "resp_claude_" + hashlib.sha256(source.encode()).hexdigest()[:32]
++
++    # A no-assistant failure may carry a positively identified user turn. With
++    # assistant API errors, use the exact first-assistant ID the forwarder uses.
++    expected_response = response_for(first_error_source or user_id)
++    if response_id != expected_response:
++        return None
++    if last_assistant_message and (not error_texts or last_assistant_message != error_texts[-1]):
++        return None
++    result: dict[str, object] = {
++        "harness": "claude-native",
++        "turn_id": current["uuid"],
++        "external_session_id": external_session_id,
++        "kind": kind,
++        "before_work": True,
++    }
++    if model:
++        result["model"] = model
++    return result
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 153784017..2106a2666 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import copy
+ import dataclasses
+ import functools
+ import itertools
+@@ -137,6 +138,7 @@ from omnigent.runner.native import (
+     _unwrap_resolved_spec,
+ )
+ from omnigent.runner.native import orchestration as _native_runtime
++from omnigent.runner.native.fallback import NativeFallbackTurn, spec_for_candidate
+ from omnigent.runner.native.interrupt import MarkSubagentTerminalAndWake, NativeInterruptRunner
+ from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+ from omnigent.runner.resource_registry import (
+@@ -2708,6 +2710,14 @@ def create_runner_app(
+     # every spec-derived read (native-vs-SDK checks above all) still answers
+     # with the harness the spec declared, which a routed session is not on.
+     _session_harness_overrides: dict[str, str] = {}
++    _native_fallback_turns: dict[str, NativeFallbackTurn] = {}
++    _native_input_commits: dict[str, dict[str, str]] = {}
++    _native_fallback_started: set[str] = set()
++    _native_fallback_tasks: dict[str, asyncio.Future[None]] = {}
++    _native_fallback_switching: set[str] = set()
++    _native_fallback_closing: set[tuple[str, str]] = set()
++    _native_fallback_aborting: set[str] = set()
++    app.state.native_fallback_turns = _native_fallback_turns
+     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
+     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
+     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
+@@ -3224,6 +3234,8 @@ def create_runner_app(
+                 "session_id": event.session_id,
+             },
+         )
++        if (event.session_id, event.terminal_name) in _native_fallback_closing:
++            return
+         # Auxiliary terminals do not own the session control plane. In
+         # particular, losing Codex's streamable TUI must not cancel an active
+         # app-server turn; the native-terminal ensure path can recreate it.
+@@ -4399,6 +4411,7 @@ def create_runner_app(
+         # (or reborn) session.
+         _session_cache_generations[session_id] = _session_cache_generations.get(session_id, 0) + 1
+ 
++        _native_fallback_turns.pop(session_id, None)
+         _session_spec_cache.pop(session_id, None)
+         _session_harness_overrides.pop(session_id, None)
+         _session_skills_cache.pop(session_id, None)
+@@ -6449,6 +6462,8 @@ def create_runner_app(
+ 
+         _active_turns.pop(conv_id, None)
+         _release_live_turn_markers(conv_id)
++        if conv_id in _native_fallback_aborting:
++            return
+         # Transport-loss ending desyncs harness from runner; flag for clean rebind.
+         if error is not None and error.get("code") == "connection_error":
+             _desynced_sessions.add(conv_id)
+@@ -7343,6 +7358,19 @@ def create_runner_app(
+             )
+             harness_name = canonicalize_harness(h) or h
+ 
++        if not msg_body.get("_native_fallback_replay") and cached_spec is not None:
++            pending_id = msg_body.get("pending_input_id")
++            committed_id = (
++                _native_input_commits.get(conv, {}).get(pending_id)
++                if isinstance(pending_id, str)
++                else None
++            )
++            if committed_id:
++                msg_body["persisted_item_id"] = committed_id
++            captured = NativeFallbackTurn.capture(cached_spec, cached_spec_entry, msg_body)
++            if captured is not None:
++                _native_fallback_turns[conv] = captured
++
+         if conv not in _session_histories:
+             _session_histories[conv] = (
+                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
+@@ -7626,6 +7654,10 @@ def create_runner_app(
+                 await_notify=False,
+             )
+ 
++        if msg_body.get("_native_fallback_replay"):
++            retry_state = _native_fallback_turns.get(conv)
++            if retry_state is not None:
++                retry_state.awaiting_replay_echo = True
+         try:
+             response = await _stream_message_to_harness(
+                 harness_body,
+@@ -7743,6 +7775,13 @@ def create_runner_app(
+                         "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                     },
+                 )
++        if dispatch is None and not body.get("_native_fallback_replay"):
++            resolved_entry = _session_spec_cache.get(conv_id)
++            resolved_spec = _unwrap_resolved_spec(resolved_entry)
++            if resolved_spec is not None:
++                captured = NativeFallbackTurn.capture(resolved_spec, resolved_entry, body)
++                if captured is not None:
++                    _native_fallback_turns[conv_id] = captured
+         if spawn_env is None:
+             spawn_env = await _resolve_native_spawn_env(
+                 harness_name,
+@@ -8427,6 +8466,109 @@ def create_runner_app(
+             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+         )
+ 
++    async def _resume_native_fallback(conv_id: str, turn: NativeFallbackTurn) -> None:
++        # Let the failed provider's status POST return before cancelling its forwarder.
++        await asyncio.sleep(0.1)
++        if turn.closed or _native_fallback_turns.get(conv_id) is not turn or turn.pending is None:
++            return
++        decision = turn.pending
++        _native_fallback_switching.add(conv_id)
++        try:
++            initial_dispatch = _active_turns.get(conv_id)
++            if initial_dispatch is not None and not initial_dispatch.done():
++                _, pending = await asyncio.wait({initial_dispatch}, timeout=5.0)
++                if pending:
++                    raise RuntimeError("Original native dispatch did not settle after failure")
++            await _native_runtime._cancel_auto_forwarder_task(conv_id)
++            await _native_runtime.teardown_codex_native_app_server(conv_id)
++            previous = decision["previous_harness"]
++            terminal = native_terminal_name(previous)
++            if terminal is not None and resource_registry.terminal_registry is not None:
++                _native_fallback_closing.add((conv_id, terminal))
++                try:
++                    await resource_registry.close_terminal(
++                        conv_id, terminal_resource_id(terminal, "main")
++                    )
++                finally:
++                    _native_fallback_closing.discard((conv_id, terminal))
++            if process_manager is not None:
++                await process_manager.release(conv_id)
++            if turn.closed or _native_fallback_turns.get(conv_id) is not turn:
++                return
++            if binding := _session_comment_relays.pop(conv_id, None):
++                binding.relay.close()
++            spec = spec_for_candidate(turn.spec, turn.selected)
++            _session_spec_cache[conv_id] = _rewrap_like(
++                turn.spec_entry, spec, _resolved_spec_workdir(turn.spec_entry)
++            )
++            _session_harness_overrides[conv_id] = turn.selected.harness
++            _session_snapshot_cache.pop(conv_id, None)
++            _session_init_envelopes.pop(conv_id, None)
++            _drop_session_claude_launch_config(conv_id)
++            _session_histories[conv_id] = []
++            if turn.selected.reasoning_effort:
++                _session_reasoning_effort[conv_id] = turn.selected.reasoning_effort
++            else:
++                _session_reasoning_effort.pop(conv_id, None)
++            message = copy.deepcopy(turn.message)
++            message.update(
++                model_override=turn.selected.model,
++                harness_override=turn.selected.harness,
++                _native_fallback_replay=True,
++            )
++            message["reasoning"] = (
++                {"effort": turn.selected.reasoning_effort}
++                if turn.selected.reasoning_effort
++                else {}
++            )
++            notice = (
++                f"Retrying with {turn.selected.model} after "
++                f"{decision['previous_model']} was unavailable."
++            )
++            _logger.info(
++                "native fallback session=%s attempt=%s model=%s harness=%s",
++                conv_id,
++                decision["attempt_id"],
++                turn.selected.model,
++                turn.selected.harness,
++            )
++            if server_client is not None:
++                try:
++                    await server_client.post(
++                        f"/v1/sessions/{conv_id}/events",
++                        json={
++                            "type": "external_conversation_item",
++                            "data": {
++                                "item_type": "message",
++                                "item_data": {
++                                    "type": "message",
++                                    "role": "assistant",
++                                    "content": [{"type": "output_text", "text": notice}],
++                                },
++                            },
++                        },
++                    )
++                except httpx.HTTPError:
++                    _logger.warning("Could not persist native fallback notice for %s", conv_id)
++            _begin_turn_slot(conv_id)
++            _active_turns[conv_id] = asyncio.current_task()
++            resource_registry.note_session_turn_started(conv_id)
++            await _run_turn_bg(message, conv_id)
++        except asyncio.CancelledError:
++            turn.closed = True
++            raise
++        except Exception as exc:  # noqa: BLE001 - terminate a failed recovery
++            turn.closed = True
++            _on_proxy_stream_end(
++                conv_id,
++                error={
++                    "code": "native_fallback_failed",
++                    "message": f"Native fallback could not start: {exc}",
++                },
++            )
++        finally:
++            _native_fallback_switching.discard(conv_id)
++
+     @app.post("/v1/sessions/{conversation_id}/events")
+     async def post_session_events(
+         conversation_id: str,
+@@ -8470,6 +8612,19 @@ def create_runner_app(
+                         "detail": "session message body must be a JSON object",
+                     },
+                 )
++            while True:
++                transition = _native_fallback_tasks.get(conversation_id)
++                if transition is None or transition.done():
++                    break
++                # Preserve ordering until the claimed replacement has injected
++                # its original input or has visibly failed to start. An abort
++                # cancels this task and replaces it with a cleanup barrier, so
++                # re-read the gate after cancellation. Shield preserves caller
++                # cancellation without allowing it to cancel shared recovery.
++                await asyncio.gather(asyncio.shield(transition), return_exceptions=True)
++            prior_fallback = _native_fallback_turns.get(conversation_id)
++            if prior_fallback is not None:
++                prior_fallback.closed = True
+             message_body = dict(body)
+             message_body["conversation_id"] = conversation_id
+ 
+@@ -8613,6 +8768,124 @@ def create_runner_app(
+                     _ingest_now_serving[conversation_id] = _seq + 1
+                     _cond.notify_all()
+ 
++        if body_type in {"interrupt", "stop_session"}:
++            fallback_turn = _native_fallback_turns.get(conversation_id)
++            if fallback_turn is not None:
++                fallback_turn.closed = True
++
++        if body_type == "native_input_committed":
++            pending_id, item_id = body.get("pending_input_id"), body.get("persisted_item_id")
++            turn = _native_fallback_turns.get(conversation_id)
++            response_id = body.get("response_id")
++            if isinstance(pending_id, str) and isinstance(item_id, str):
++                _native_input_commits[conversation_id] = {pending_id: item_id}
++                if turn is not None and turn.message.get("pending_input_id") == pending_id:
++                    turn.message["persisted_item_id"] = item_id
++                    turn.input_response_id = response_id if isinstance(response_id, str) else None
++            elif turn is not None:
++                if turn.awaiting_replay_echo or (
++                    turn.input_response_id is None
++                    and not turn.message.get("pending_input_id")
++                    and isinstance(response_id, str)
++                ):
++                    turn.awaiting_replay_echo = False
++                    turn.input_response_id = response_id if isinstance(response_id, str) else None
++                else:
++                    # A terminal-only input cannot inherit a captured web input.
++                    turn.closed = True
++            return Response(status_code=204)
++
++        if body_type == "native_fallback_claim":
++            turn = _native_fallback_turns.get(conversation_id)
++            data = body.get("data", {})
++            if turn is None or not isinstance(data, dict):
++                return JSONResponse({"declined": True})
++            # A pending token is idempotent even while its replacement starts.
++            failure = data.get("native_failure") or {}
++            identity = (
++                failure.get("harness"),
++                failure.get("external_session_id"),
++                failure.get("turn_id"),
++            )
++            if identity in turn.failures:
++                if turn.pending_identity != identity or (
++                    turn.pending and turn.pending["attempt_id"] in _native_fallback_started
++                ):
++                    return JSONResponse({"ignored": True})
++                return JSONResponse({"fallback": turn.pending})
++            if (
++                data.get("expected_external_session_id")
++                and failure.get("external_session_id") != data["expected_external_session_id"]
++            ):
++                return JSONResponse({"ignored": True})
++            if _session_message_buffers.get(conversation_id) or pending_approvals.has_pending(
++                conversation_id
++            ):
++                return JSONResponse({"declined": True})
++            decision = turn.claim(data)
++            if decision is None:
++                return JSONResponse({"declined": True, "attempted_models": turn.attempted})
++            return JSONResponse({"fallback": decision})
++
++        if body_type == "native_fallback_abort":
++            turn = _native_fallback_turns.get(conversation_id)
++            if (
++                turn is None
++                or turn.pending is None
++                or turn.pending["attempt_id"] != body.get("attempt_id")
++            ):
++                return JSONResponse({"aborted": False})
++            turn.closed = True
++            transition = _native_fallback_tasks.get(conversation_id)
++            abort_finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
++            _native_fallback_tasks[conversation_id] = abort_finished
++            _native_fallback_aborting.add(conversation_id)
++            try:
++                if transition is not None and not transition.done():
++                    transition.cancel()
++                    await asyncio.gather(transition, return_exceptions=True)
++                await _native_runtime._cancel_auto_forwarder_task(conversation_id)
++                await _native_runtime.teardown_codex_native_app_server(conversation_id)
++                terminal = native_terminal_name(_session_harness_name(conversation_id))
++                if terminal is not None and resource_registry.terminal_registry is not None:
++                    _native_fallback_closing.add((conversation_id, terminal))
++                    try:
++                        await resource_registry.close_terminal(
++                            conversation_id, terminal_resource_id(terminal, "main")
++                        )
++                    finally:
++                        _native_fallback_closing.discard((conversation_id, terminal))
++                await process_manager.release(conversation_id)
++                _active_turns.pop(conversation_id, None)
++                _release_live_turn_markers(conversation_id)
++            finally:
++                _native_fallback_aborting.discard(conversation_id)
++                if not abort_finished.done():
++                    abort_finished.set_result(None)
++            return JSONResponse({"aborted": True})
++
++        if body_type == "native_fallback_start":
++            turn = _native_fallback_turns.get(conversation_id)
++            attempt_id = body.get("attempt_id")
++            if (
++                turn is None
++                or turn.closed
++                or turn.pending is None
++                or turn.pending["attempt_id"] != attempt_id
++            ):
++                return JSONResponse({"started": False}, status_code=409)
++            if attempt_id in _native_fallback_started:
++                return JSONResponse({"started": True})
++            _native_fallback_started.add(attempt_id)
++            task = asyncio.create_task(
++                _resume_native_fallback(conversation_id, turn),
++                name=f"native-fallback-{conversation_id}",
++            )
++            _native_fallback_tasks[conversation_id] = task
++            _background_tasks.add(task)
++            task.add_done_callback(_background_tasks.discard)
++            return JSONResponse({"started": True})
++
+         if body_type == "interrupt":
+             _harness = _session_harness_name(conversation_id)
+             _interrupt_resp = await _native_interrupt_runner.interrupt(_harness, conversation_id)
+@@ -8626,6 +8899,12 @@ def create_runner_app(
+             status = data.get("status") if isinstance(data, dict) else None
+             forwarded_output = data.get("output") if isinstance(data, dict) else None
+             output = forwarded_output if isinstance(forwarded_output, str) else None
++            fallback_turn = _native_fallback_turns.get(conversation_id)
++            if fallback_turn is not None and isinstance(data, dict):
++                if status == "running" and isinstance(data.get("response_id"), str):
++                    fallback_turn.running_response_id = data["response_id"]
++                elif status in {"idle", "failed"}:
++                    fallback_turn.closed = True
+             delivery_ack: _SubagentDeliveryAck | None = None
+             recovered_entry: _SubagentWorkEntry | None = None
+             if status in ("running", "waiting", "idle", "failed"):
+@@ -9486,9 +9765,15 @@ def create_runner_app(
+                 conv_id,
+                 extra={"session_id": conv_id},
+             )
++            if conv_id in _native_fallback_switching:
++                raise
+             return
+         status = getattr(resp, "status_code", 200)
+         if status >= 400:
++            if conv_id in _native_fallback_switching:
++                raise RuntimeError(
++                    "Native fallback terminal could not preserve and resume context"
++                )
+             _logger.warning(
+                 "native pane self-heal returned status %s for conv=%s (%s)",
+                 status,
+diff --git a/omnigent/runner/native/fallback.py b/omnigent/runner/native/fallback.py
+new file mode 100644
+index 000000000..810b8502b
+--- /dev/null
++++ b/omnigent/runner/native/fallback.py
+@@ -0,0 +1,167 @@
++"""Bounded native fallback decisions for a single, exactly captured input."""
++
++from __future__ import annotations
++
++import copy
++import dataclasses
++import hashlib
++import uuid
++from typing import Any, cast
++
++from omnigent.harness_aliases import canonicalize_harness
++from omnigent.spec.types import AgentSpec
++
++HISTORY_BEFORE_LABEL = "omnigent.native_fallback.history_before_item_id"
++ATTEMPT_LABEL = "omnigent.native_fallback.attempt_id"
++NATIVE_HARNESSES = frozenset({"codex-native", "claude-native"})
++ELIGIBLE_FAILURES = frozenset({"model_unavailable", "rate_limit", "provider_unavailable"})
++
++
++@dataclasses.dataclass(frozen=True)
++class NativeCandidate:
++    model: str
++    harness: str
++    reasoning_effort: str | None
++
++    def as_dict(self) -> dict[str, Any]:
++        return dataclasses.asdict(self)
++
++
++def candidate_for_spec(spec: AgentSpec, message: dict[str, Any]) -> NativeCandidate:
++    harness = message.get("harness_override") or spec.executor.config.get("harness")
++    harness = canonicalize_harness(harness) or harness or ""
++    effort = message.get("reasoning", {}).get("effort") or spec.executor.reasoning_effort
++    return NativeCandidate(
++        message.get("model_override") or spec.executor.model or "", harness, effort
++    )
++
++
++def spec_for_candidate(spec: AgentSpec, candidate: NativeCandidate) -> AgentSpec:
++    """Retain role policy and tools while replacing only its native selection."""
++    result = copy.deepcopy(spec)
++    result.executor.model = candidate.model
++    result.executor.reasoning_effort = candidate.reasoning_effort
++    result.executor.config["harness"] = candidate.harness
++    # CLI-specific autonomy flags cannot migrate to a different provider.
++    if candidate.harness != canonicalize_harness(spec.executor.config.get("harness")):
++        result.executor.config["yolo"] = False
++        result.executor.config["permission_mode"] = "default"
++    return result
++
++
++@dataclasses.dataclass
++class NativeFallbackTurn:
++    message: dict[str, Any]
++    spec: AgentSpec
++    spec_entry: Any
++    selected: NativeCandidate
++    remaining: list[NativeCandidate]
++    attempted: list[str]
++    failures: set[tuple[str, str, str]] = dataclasses.field(default_factory=set)
++    pending: dict[str, Any] | None = None
++    pending_identity: tuple[str, str, str] | None = None
++    closed: bool = False
++    running_response_id: str | None = None
++    input_response_id: str | None = None
++    awaiting_replay_echo: bool = False
++
++    @classmethod
++    def capture(
++        cls, spec: AgentSpec, spec_entry: Any, message: dict[str, Any]
++    ) -> NativeFallbackTurn | None:
++        primary = candidate_for_spec(spec, message)
++        fallbacks = getattr(spec.executor, "fallbacks", None)
++        item_id = message.get("persisted_item_id") or message.get("pending_input_id")
++        if (
++            primary.harness not in NATIVE_HARNESSES
++            or not fallbacks
++            or not isinstance(item_id, str)
++            or not item_id
++        ):
++            return None
++        remaining = [
++            NativeCandidate(
++                f.model, canonicalize_harness(f.harness) or f.harness, f.reasoning_effort
++            )
++            for f in fallbacks
++        ]
++        # A successful fallback remains selected for the next user input.
++        for index, candidate in enumerate(remaining):
++            if (candidate.harness, candidate.model) == (primary.harness, primary.model):
++                remaining = remaining[index + 1 :]
++                break
++        remaining = [
++            c for c in remaining if (c.harness, c.model) != (primary.harness, primary.model)
++        ][:2]
++        return cls(
++            copy.deepcopy(message),
++            copy.deepcopy(spec),
++            spec_entry,
++            primary,
++            remaining,
++            [primary.model],
++        )
++
++    def claim(self, data: dict[str, Any]) -> dict[str, Any] | None:
++        failure = data.get("native_failure")
++        if not isinstance(failure, dict):
++            return None
++        identity = (
++            failure.get("harness"),
++            failure.get("external_session_id"),
++            failure.get("turn_id"),
++        )
++        if not all(isinstance(v, str) and v for v in identity):
++            return None
++        identity = cast(tuple[str, str, str], identity)
++        if identity in self.failures:
++            return self.pending if identity == self.pending_identity else {"ignored": True}
++        if (
++            self.closed
++            or failure.get("before_work") is not True
++            or failure.get("kind") not in ELIGIBLE_FAILURES
++        ):
++            return None
++        if identity[0] != self.selected.harness:
++            return None
++        reported = failure.get("model")
++        if reported and reported != self.selected.model:
++            return None
++        expected = data.get("expected_external_session_id")
++        if not expected or identity[1] != expected:
++            return None
++        if (
++            self.running_response_id
++            and data.get("response_id")
++            and data["response_id"] != self.running_response_id
++        ):
++            return None
++        if self.input_response_id:
++            expected_response = (
++                ("codex_" + identity[2])
++                if identity[0] == "codex-native"
++                else ("resp_claude_" + hashlib.sha256(identity[2].encode()).hexdigest()[:32])
++            )
++            if expected_response != self.input_response_id:
++                return None
++        if not self.message.get("persisted_item_id"):
++            return None
++        if not self.remaining:
++            self.closed = True
++            return None
++        candidate = self.remaining.pop(0)
++        self.failures.add(identity)
++        self.pending_identity = identity
++        self.pending = {
++            "attempt_id": uuid.uuid4().hex,
++            "history_before_item_id": self.message["persisted_item_id"],
++            "previous_model": self.selected.model,
++            "previous_harness": self.selected.harness,
++            "expected_external_session_id": identity[1],
++            **candidate.as_dict(),
++        }
++        self.selected = candidate
++        self.attempted.append(candidate.model)
++        self.running_response_id = None
++        self.input_response_id = None
++        return self.pending
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 942cc0972..853f455ec 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -466,6 +466,7 @@ class _CodexNativeLaunchConfig:
+     fork_source_external_id: str | None
+     fork_carry_history: bool
+     bypass_sandbox: bool
++    history_before_item_id: str | None = None
+     auto_harness: bool = False
+     routing_enabled: bool = False
+     turn_routing: bool = False
+@@ -1057,6 +1058,11 @@ async def _codex_native_launch_config(
+         fork_source_external_id=fork_source_external_id,
+         fork_carry_history=fork_carry_history,
+         bypass_sandbox=bypass_sandbox,
++        history_before_item_id=(
++            labels.get("omnigent.native_fallback.history_before_item_id")
++            if isinstance(labels, dict) and external_session_id is None
++            else None
++        ),
+         auto_harness=routing_class.auto_harness,
+         routing_enabled=routing_class.routing_enabled,
+         turn_routing=routing_class.turn_routing,
+@@ -4092,8 +4098,11 @@ async def _auto_create_codex_terminal(
+                 model_provider=_session_meta_provider,
+                 codex_path=_codex_cli_path,
+                 terminal_launch_args=launch_config.terminal_launch_args,
++                history_before_item_id=launch_config.history_before_item_id,
+             )
+-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
++        except Exception:
++            if launch_config.history_before_item_id is not None:
++                raise
+             built_rollout = None
+             _logger.warning(
+                 "Could not build rollout from items for forked codex clone %s; launching fresh",
+@@ -6272,6 +6281,7 @@ class _ClaudeSessionLaunchMetadata:
+     external_session_id: str | None = None
+     fork_source_external_id: str | None = None
+     fork_carry_history: bool = False
++    history_before_item_id: str | None = None
+     #: Both routing fields come from ``routing_class_from_snapshot``, so an
+     #: auto-harness session always reads as routing-enabled too. Deriving them
+     #: separately was the bug: a sub-agent child of a routed parent carries the
+@@ -6319,6 +6329,11 @@ def _claude_launch_metadata_from_envelope(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        history_before_item_id=(
++            snapshot.labels.get("omnigent.native_fallback.history_before_item_id")
++            if snapshot.external_session_id is None
++            else None
++        ),
+     )
+ 
+ 
+@@ -6384,6 +6399,11 @@ async def _load_legacy_claude_launch_metadata(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        history_before_item_id=(
++            labels.get("omnigent.native_fallback.history_before_item_id")
++            if external_session_id is None
++            else None
++        ),
+     )
+     _logger.info(
+         "Claude terminal launch config fetched: session=%s status=%s effort_set=%s "
+@@ -6676,7 +6696,11 @@ async def _auto_create_claude_terminal(
+     # reconnect request arrives without a workspace-scoped context (the
+     # ContextVar defaults to 0 on fresh tasks). Fall back to the claude_session_id
+     # captured from the bridge state file before prepare_bridge_dir wiped it.
+-    if session_external_id is None and _pre_wipe_claude_sid is not None:
++    if (
++        session_external_id is None
++        and _pre_wipe_claude_sid is not None
++        and launch_metadata.history_before_item_id is None
++    ):
+         session_external_id = _pre_wipe_claude_sid
+         _logger.info(
+             "cold-resume fallback: server snapshot missing external_session_id, "
+@@ -6805,8 +6829,11 @@ async def _auto_create_claude_terminal(
+                 session_id=session_id,
+                 external_session_id=our_uuid,
+                 workspace=_clone_workspace,
++                history_before_item_id=launch_metadata.history_before_item_id,
+             )
+-        except Exception:  # noqa: BLE001 — best-effort; launch fresh on failure
++        except Exception:
++            if launch_metadata.history_before_item_id is not None:
++                raise
+             _built = None
+             _logger.warning(
+                 "Could not build native transcript from items for forked clone %s; "
+diff --git a/omnigent/runner/resource_registry.py b/omnigent/runner/resource_registry.py
+index b0a531d08..e198330a3 100644
+--- a/omnigent/runner/resource_registry.py
++++ b/omnigent/runner/resource_registry.py
+@@ -1205,10 +1205,23 @@ class SessionResourceRegistry:
+             # :meth:`note_external_session_status`).
+             if status_publisher is None:
+                 return
+-            if not self._claim_status_edge(session_id, status, blocked_on):
+-                return
+-            self._set_session_status_memo(session_id, status)
+-            loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
++
++            def _deliver_status() -> None:
++                # A retired watcher may already have queued an edge while its
++                # replacement starts. Fence by instance, not terminal name:
++                # fallback reuses the same name and session key.
++                if (
++                    self._terminal_registry is None
++                    or self._terminal_registry.get(session_id, terminal_name, session_key)
++                    is not instance
++                ):
++                    return
++                if not self._claim_status_edge(session_id, status, blocked_on):
++                    return
++                self._set_session_status_memo(session_id, status)
++                status_publisher(session_id, status, blocked_on)
++
++            loop.call_soon_threadsafe(_deliver_status)
+ 
+         def _file_owns_status() -> bool:
+             # Once Claude's own status file is readable it is the session's
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 7a12729c8..a72177413 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -2215,6 +2215,7 @@ async def _persist_external_conversation_item(
+     conversation_store: ConversationStore,
+     created_by: str | None = None,
+     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
++    runner_router: RunnerRouter | None = None,
+ ) -> str:
+     """
+     Persist and broadcast a conversation item produced outside AP.
+@@ -2296,6 +2297,22 @@ async def _persist_external_conversation_item(
+         session_id, persisted, cleared_pending_id=cleared_pending_id
+     )
+     _drive_terminal_resolved_elicitation(session_id, persisted)
++    if (
++        item.type == "message"
++        and isinstance(item.data, MessageData)
++        and item.data.role == "user"
++        and not item.data.is_meta
++    ):
++        await _forward_session_change_to_runner(
++            session_id,
++            runner_router,
++            {
++                "type": "native_input_committed",
++                "pending_input_id": cleared_pending_id,
++                "persisted_item_id": persisted.id,
++                "response_id": body.data.get("response_id"),
++            },
++        )
+     return persisted.id
+ 
+ 
+@@ -4295,6 +4312,7 @@ async def _forward_native_terminal_message(
+     file_store: FileStore | None = None,
+     artifact_store: ArtifactStore | None = None,
+     model_override: str | None = None,
++    pending_input_id: str | None = None,
+ ) -> None:
+     """
+     Forward one Omnigent web-chat message to the native terminal harness.
+@@ -4324,6 +4342,12 @@ async def _forward_native_terminal_message(
+     """
+     display_name, _, harness = _native_terminal_runtime(conv)
+     event = _build_native_terminal_message_event(conv, body, model_override=model_override)
++    if pending_input_id is not None:
++        event["pending_input_id"] = pending_input_id
++    if conv.model_override and "model_override" not in event:
++        event["model_override"] = conv.model_override
++    if conv.harness_override:
++        event["harness_override"] = conv.harness_override
+     _logger.info(
+         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
+         display_name,
+@@ -5880,6 +5904,7 @@ async def _dispatch_session_event_to_runner_impl(
+                 session_id,
+                 conv,
+                 body,
++                pending_input_id=pending_id,
+                 file_store=file_store,
+                 artifact_store=artifact_store,
+                 # The executor speaks the pane's own vocabulary, so it takes the
+diff --git a/omnigent/server/routes/sessions/native_fallback.py b/omnigent/server/routes/sessions/native_fallback.py
+new file mode 100644
+index 000000000..66240e705
+--- /dev/null
++++ b/omnigent/server/routes/sessions/native_fallback.py
+@@ -0,0 +1,142 @@
++"""Commit and start native fallback before publishing a terminal failure."""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++from typing import Any
++
++from omnigent.runner.native.fallback import ATTEMPT_LABEL
++
++
++def _payload(result: Any) -> dict[str, Any] | None:
++    if result is None or not 200 <= result.status_code < 300:
++        return None
++    try:
++        value = json.loads(result.body)
++    except (TypeError, ValueError):
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def obsolete_native_status(conv: Any, data: dict[str, Any]) -> bool:
++    """A switched session never accepts terminal edges from its abandoned vendor session."""
++    source = data.get("native_source") or data.get("native_failure")
++    return bool(
++        conv.labels.get(ATTEMPT_LABEL)
++        and isinstance(source, dict)
++        and source.get("external_session_id")
++        and source["external_session_id"] != conv.external_session_id
++    )
++
++
++def native_fallback_lock(request: Any, session_id: str) -> asyncio.Lock:
++    """Serialize input admission with the short claim/persist/start transition."""
++    locks = getattr(request.app.state, "native_fallback_locks", None)
++    if locks is None:
++        locks = request.app.state.native_fallback_locks = {}
++    return locks.setdefault(session_id, asyncio.Lock())
++
++
++async def try_native_fallback(
++    *,
++    session_id: str,
++    data: dict[str, Any],
++    request: Any,
++    conversation_store: Any,
++    runner_router: Any,
++    forward: Any,
++    admission_locked: bool = False,
++) -> bool:
++    """Return true only for an acknowledged replacement or an obsolete status edge."""
++    if not isinstance(data.get("native_failure"), dict):
++        return False
++    async with (
++        contextlib.nullcontext() if admission_locked else native_fallback_lock(request, session_id)
++    ):
++        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
++        if conv is None:
++            return False
++        if conv.external_session_id and obsolete_native_status(conv, data):
++            return True
++        claim = _payload(
++            await forward(
++                session_id,
++                runner_router,
++                {
++                    "type": "native_fallback_claim",
++                    "data": {**data, "expected_external_session_id": conv.external_session_id},
++                },
++            )
++        )
++        if claim is None:
++            # A claim never starts work. With no acknowledgment, normal failure is safe.
++            return False
++        if claim.get("ignored") is True:
++            return True
++        decision = claim.get("fallback")
++        if not isinstance(decision, dict) or not isinstance(decision.get("attempt_id"), str):
++            attempted = claim.get("attempted_models")
++            if isinstance(attempted, list) and len(attempted) > 1:
++                data["output"] = (
++                    f"{data.get('output') or 'Native turn failed'}\nAttempted models: {', '.join(str(m) for m in attempted)}."
++                )
++            return False
++        harness = decision.get("harness")
++        if harness not in {"codex-native", "claude-native"}:
++            return False
++        # Cross-family permissions start conservatively; vendor-specific flags
++        # and stale bypass labels cannot expand the old attempt's authority.
++        previous_harness = decision.get("previous_harness")
++        if harness == previous_harness:
++            launch_args = list(conv.terminal_launch_args or [])
++        elif harness == "codex-native":
++            sandbox = (
++                "read-only" if "plan" in (conv.terminal_launch_args or []) else "workspace-write"
++            )
++            launch_args = ["--sandbox", sandbox, "--ask-for-approval", "untrusted"]
++        else:
++            mode = "plan" if "read-only" in (conv.terminal_launch_args or []) else "default"
++            launch_args = ["--permission-mode", mode]
++        try:
++            await asyncio.to_thread(
++                conversation_store.apply_native_fallback,
++                session_id,
++                attempt_id=decision["attempt_id"],
++                expected_external_session_id=decision["expected_external_session_id"],
++                model=decision["model"],
++                harness=harness,
++                reasoning_effort=decision.get("reasoning_effort"),
++                history_before_item_id=decision["history_before_item_id"],
++                terminal_launch_args=launch_args,
++            )
++        except (LookupError, ValueError, NotImplementedError):
++            return False
++        event = {"type": "native_fallback_start", "attempt_id": decision["attempt_id"]}
++        for _ in range(2):
++            result = await forward(session_id, runner_router, event)
++            if result is not None and result.status_code == 409:
++                data["output"] = (
++                    "Native fallback could not start because its captured input is no longer current."
++                )
++                return False
++            started = _payload(result)
++            if started is not None:
++                if started.get("started") is True:
++                    return True
++                return False
++        # Fence the current token before reporting the uncertain transport
++        # outcome. A later user input makes this abort a no-op on the runner.
++        await forward(
++            session_id,
++            runner_router,
++            {
++                "type": "native_fallback_abort",
++                "attempt_id": decision["attempt_id"],
++            },
++        )
++        data["output"] = (
++            "Native fallback acknowledgment was unavailable. Recovery was stopped where reachable; its final outcome could not be confirmed."
++        )
++        return False
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 6785fe6f4..0e6104d28 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -415,13 +415,20 @@ def register_events_routes(
+         runner launch it triggers — so the session list reports a booting
+         session as running instead of idle.
+         """
+-        with contextlib.ExitStack() as in_flight:
+-            return await _post_event_impl(
+-                request,
+-                session_id,
+-                body,
+-                in_flight=in_flight if body.type == "message" else None,
+-            )
++        async with contextlib.AsyncExitStack() as admission:
++            if body.type in {"message", _EXTERNAL_SESSION_STATUS_TYPE}:
++                from omnigent.server.routes.sessions.native_fallback import native_fallback_lock
++
++                # Keep input admission behind the complete status transition,
++                # including failed start publication and terminal delivery.
++                await admission.enter_async_context(native_fallback_lock(request, session_id))
++            with contextlib.ExitStack() as in_flight:
++                return await _post_event_impl(
++                    request,
++                    session_id,
++                    body,
++                    in_flight=in_flight if body.type == "message" else None,
++                )
+ 
+     async def _post_event_impl(
+         request: Request,
+@@ -1171,6 +1178,7 @@ def register_events_routes(
+                 conversation_store,
+                 created_by=created_by,
+                 background_title_coordinator=background_title_coordinator,
++                runner_router=runner_router,
+             )
+             return {"queued": False, "item_id": item_id}
+         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
+@@ -1267,6 +1275,25 @@ def register_events_routes(
+             data = await _enrich_terminal_status_with_subagent_output(
+                 body.data, status, session_id, conversation_store
+             )
++            from omnigent.server.routes.sessions.native_fallback import (
++                obsolete_native_status,
++                try_native_fallback,
++            )
++
++            if status == "failed" and await try_native_fallback(
++                session_id=session_id,
++                data=data,
++                request=request,
++                conversation_store=conversation_store,
++                runner_router=runner_router,
++                forward=_forward_session_change_to_runner,
++                admission_locked=True,
++            ):
++                return {"queued": False, "native_fallback": True}
++            if (
++                status != "failed" or not isinstance(data.get("native_failure"), dict)
++            ) and obsolete_native_status(conv, data):
++                return {"queued": False, "ignored": True}
+             # Surface the failure reason a native forwarder carries so a
+             # top-level session sees it on its own status edge and persisted
+             # last_task_error, not only the sub-agent parent-inbox path.
+diff --git a/omnigent/spec/AGENTSPEC.md b/omnigent/spec/AGENTSPEC.md
+index 8ccf45e1b..986882d57 100644
+--- a/omnigent/spec/AGENTSPEC.md
++++ b/omnigent/spec/AGENTSPEC.md
+@@ -71,6 +71,52 @@ params:                       # arbitrary key-value; readable by skills and tool
+   prefer_recent: true
+ ```
+ 
++### `executor.fallbacks` — ordered native model backups
++
++Native Codex and Claude executors can declare up to two explicit backups:
++
++```yaml
++executor:
++  type: omnigent
++  model: gpt-6-astra
++  reasoning_effort: xhigh
++  config:
++    harness: codex-native
++    yolo: false
++  fallbacks:
++    - model: claude-fable-5-1
++      harness: claude-native
++      reasoning_effort: max
++    - model: claude-opus-5
++      harness: claude-native
++      reasoning_effort: max
++```
++
++The default is an empty list, so existing agents do not gain automatic model
++switching. Each entry accepts only `model`, `harness`, and optional
++`reasoning_effort`. Both the primary and backups must use `codex-native` or
++`claude-native`, with an explicit primary model. Duplicate model/harness pairs,
++unsupported effort values, and more than two backups are rejected. Chains use
++host-managed native credentials; executor auth, connection, and profile
++overrides are not supported. Model availability still requires host verification.
++
++Recovery applies to a runner-captured, persisted console/API input whose native
++failure identifies the same attempt and proves that no model work occurred.
++Eligible failures are model unavailability, rate limits, and provider
++unavailability. Authentication, permission denials, cancellation, unknown
++failures, and failures after output or tool work do not authorize replay. Direct
++typing in a native terminal without a captured input is outside this contract.
++Startup errors without equivalent proof must remain failures rather than being
++treated as safe replay automatically.
++
++The replacement keeps the original role, instructions, tools, skills, and policy
++binding. History reconstruction excludes the captured input, which is then sent
++once to the replacement. Cross-provider launch permissions remain conservative.
++Report the model actually used after a fallback; configured role names are not
++execution evidence. Two roles that finish on the same model family do not
++establish cross-model review. This is runtime configuration, not a prompt-only
++retry instruction or a guarantee that a provider will become available.
++
+ ### `interaction` axes
+ 
+ | Field | What it means | Who acts on it |
+diff --git a/omnigent/spec/__init__.py b/omnigent/spec/__init__.py
+index 46e0a6775..ba1613e0b 100644
+--- a/omnigent/spec/__init__.py
++++ b/omnigent/spec/__init__.py
+@@ -26,6 +26,7 @@ from omnigent.spec.types import (
+     BuiltinToolConfig,
+     DatabricksAuth,
+     ExecutorAuth,
++    ExecutorFallback,
+     ExecutorSpec,
+     FunctionPolicySpec,
+     FunctionRef,
+@@ -58,6 +59,7 @@ __all__ = [
+     "BuiltinToolConfig",
+     "DatabricksAuth",
+     "ExecutorAuth",
++    "ExecutorFallback",
+     "ExecutorSpec",
+     "ExtractionError",
+     "FunctionPolicySpec",
+diff --git a/omnigent/spec/omnigent.py b/omnigent/spec/omnigent.py
+index 33e6173af..9da2f1b9d 100644
+--- a/omnigent/spec/omnigent.py
++++ b/omnigent/spec/omnigent.py
+@@ -157,6 +157,7 @@ def agent_spec_to_agent_def(spec: AgentSpec) -> AgentDef:
+         model=spec.executor.model,
+         harness=_raw_harness,
+         profile=spec.executor.config.get("profile"),
++        fallbacks=list(spec.executor.fallbacks),
+     )
+ 
+     # ``AgentDef.name`` / ``AgentDef.prompt`` are ``str | None`` — pass
+@@ -449,6 +450,7 @@ def _sub_spec_to_agent_tool(sub: AgentSpec) -> AgentTool:
+             model=model,
+             harness=harness,
+             profile=profile,
++            fallbacks=list(sub.executor.fallbacks),
+         ),
+     )
+ 
+@@ -1791,6 +1793,7 @@ def _translate_executor_from_def(
+         model=model or None,
+         profile=profile or None,
+         auth=auth,
++        fallbacks=list(oa_executor.fallbacks) if oa_executor is not None else [],
+     )
+ 
+ 
+diff --git a/omnigent/spec/parser.py b/omnigent/spec/parser.py
+index 6eabb8618..595d34852 100644
+--- a/omnigent/spec/parser.py
++++ b/omnigent/spec/parser.py
+@@ -31,6 +31,7 @@ from omnigent.spec.types import (
+     BuiltinToolConfig,
+     CompactionConfig,
+     DatabricksAuth,
++    ExecutorFallback,
+     ExecutorSpec,
+     FunctionPolicySpec,
+     FunctionRef,
+@@ -694,9 +695,49 @@ def _parse_executor(
+         connection=connection,
+         context_window=context_window,
+         auth=auth,
++        fallbacks=_parse_executor_fallbacks(raw.get("fallbacks")),
+     )
+ 
+ 
++def _parse_executor_fallbacks(raw: object) -> list[ExecutorFallback]:
++    """Parse native backup candidates without accepting permission overrides."""
++    if raw is None:
++        return []
++    if not isinstance(raw, list) or len(raw) > 2:
++        raise OmnigentError(
++            "executor.fallbacks must be a list of at most two backups",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    candidates: list[ExecutorFallback] = []
++    for index, item in enumerate(raw):
++        path = f"executor.fallbacks[{index}]"
++        if not isinstance(item, dict) or set(item) - {"model", "harness", "reasoning_effort"}:
++            raise OmnigentError(
++                f"{path} accepts only model, harness and reasoning_effort",
++                code=ErrorCode.INVALID_INPUT,
++            )
++        model, harness, effort = (
++            item.get("model"),
++            item.get("harness"),
++            item.get("reasoning_effort"),
++        )
++        if not isinstance(model, str) or not model.strip() or any(c.isspace() for c in model):
++            raise OmnigentError(
++                f"{path}.model must be a nonempty model ID", code=ErrorCode.INVALID_INPUT
++            )
++        if harness not in ("codex-native", "claude-native"):
++            raise OmnigentError(
++                f"{path}.harness must be codex-native or claude-native",
++                code=ErrorCode.INVALID_INPUT,
++            )
++        if effort is not None and not isinstance(effort, str):
++            raise OmnigentError(
++                f"{path}.reasoning_effort must be a string", code=ErrorCode.INVALID_INPUT
++            )
++        candidates.append(ExecutorFallback(model, str(harness), effort))
++    return candidates
++
++
+ def _parse_executor_auth(
+     raw: dict[str, object],
+     *,
+diff --git a/omnigent/spec/types.py b/omnigent/spec/types.py
+index 9d10032ba..bb8afe2fd 100644
+--- a/omnigent/spec/types.py
++++ b/omnigent/spec/types.py
+@@ -8,7 +8,7 @@ from enum import Enum
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, ClassVar, Literal
+ 
+-from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
++from omnigent.inner.datamodel import ExecutorFallback, OSEnvSpec, TerminalEnvSpec
+ 
+ if TYPE_CHECKING:
+     # EvaluationContext is a runtime evaluation artifact (see
+@@ -621,6 +621,8 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
+     # Takes precedence over ambient env vars and profile auto-detection.
+     # None = fall back to env vars / profile defaults.
+     auth: ApiKeyAuth | DatabricksAuth | ProviderAuth | None = None
++    # Ordered native backups, attempted only after a proven pre-work failure.
++    fallbacks: list[ExecutorFallback] = field(default_factory=list)
+ 
+     @property
+     def harness_kind(self) -> str:
+diff --git a/omnigent/spec/validator.py b/omnigent/spec/validator.py
+index 04774a603..30a8b2676 100644
+--- a/omnigent/spec/validator.py
++++ b/omnigent/spec/validator.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import re
+ from dataclasses import dataclass, field
+ 
+-from omnigent.reasoning_effort import EFFORT_VALUES, validate_effort
++from omnigent.reasoning_effort import EFFORT_VALUES, efforts_for_harness, validate_effort
+ from omnigent.spec.types import AgentSpec, ToolRuntime
+ 
+ _SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9-]+$")
+@@ -88,6 +88,7 @@ def validate(spec: AgentSpec) -> ValidationResult:
+     _validate_executor_type(spec, result)
+     _validate_llm(spec, result)
+     _validate_reasoning_effort(spec, result)
++    _validate_executor_fallbacks(spec, result)
+     _validate_interaction(spec, result)
+     _validate_skills(spec, result)
+     _validate_mcp_servers(spec, result)
+@@ -242,6 +243,54 @@ def _validate_reasoning_effort(spec: AgentSpec, result: ValidationResult) -> Non
+         result.add("executor.reasoning_effort", str(exc))
+ 
+ 
++def _validate_executor_fallbacks(spec: AgentSpec, result: ValidationResult) -> None:
++    """Require a bounded, explicit chain using supported native executors."""
++    executor = spec.executor
++    if not executor.fallbacks:
++        return
++    path = "executor.fallbacks"
++    if executor.type != "omnigent" or executor.harness_kind not in (
++        "codex-native",
++        "claude-native",
++    ):
++        result.add(path, "requires a codex-native or claude-native primary executor")
++    if not executor.model:
++        result.add(path, "requires an explicit primary executor.model")
++    if len(executor.fallbacks) > 2:
++        result.add(path, "supports at most two backups")
++    if (
++        executor.auth is not None
++        or executor.connection is not None
++        or executor.profile
++        or executor.config.get("profile")
++    ):
++        result.add(
++            path,
++            "requires host-managed native credentials, "
++            "without executor auth, connection or profile",
++        )
++    seen = {(executor.harness_kind, executor.model)}
++    for index, candidate in enumerate(executor.fallbacks):
++        entry_path = f"{path}[{index}]"
++        if not candidate.model or any(c.isspace() for c in candidate.model):
++            result.add(entry_path + ".model", "must be a nonempty model ID")
++        if candidate.harness not in ("codex-native", "claude-native"):
++            result.add(entry_path + ".harness", "must be codex-native or claude-native")
++        key = (candidate.harness, candidate.model)
++        if key in seen:
++            result.add(entry_path, "duplicates the primary or an earlier backup")
++        seen.add(key)
++        if candidate.reasoning_effort is not None:
++            try:
++                validate_effort(
++                    candidate.reasoning_effort,
++                    entry_path + ".reasoning_effort",
++                    efforts_for_harness(candidate.harness) or frozenset(),
++                )
++            except ValueError as exc:
++                result.add(entry_path + ".reasoning_effort", str(exc))
++
++
+ def _validate_interaction(spec: AgentSpec, result: ValidationResult) -> None:
+     """
+     Validate input and output modalities against allowed values.
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index f9dd02e74..078cc933c 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -1468,6 +1468,21 @@ class ConversationStore(ABC):
+         """
+         ...
+ 
++    def apply_native_fallback(
++        self,
++        conversation_id: str,
++        *,
++        attempt_id: str,
++        expected_external_session_id: str,
++        model: str,
++        harness: str,
++        reasoning_effort: str | None,
++        history_before_item_id: str,
++        terminal_launch_args: list[str],
++    ) -> Conversation:
++        """Commit a native runtime selection without replacing the bound role."""
++        raise NotImplementedError("This store does not support native fallback")
++
+     @abstractmethod
+     def set_external_session_id(
+         self,
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 1f877bc4a..a355e46d1 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -3372,6 +3372,84 @@ class SqlAlchemyConversationStore(ConversationStore):
+             labels = _fetch_labels(ap_sess, conversation_id)
+         return _to_conversation(ap_row, meta, labels)
+ 
++    def apply_native_fallback(
++        self,
++        conversation_id: str,
++        *,
++        attempt_id: str,
++        expected_external_session_id: str,
++        model: str,
++        harness: str,
++        reasoning_effort: str | None,
++        history_before_item_id: str,
++        terminal_launch_args: list[str],
++    ) -> Conversation:
++        """Persist a runtime fallback while preserving agent binding and policy labels."""
++        from omnigent.native_coding_agents import native_coding_agent_for_harness
++        from omnigent.runner.native.fallback import ATTEMPT_LABEL, HISTORY_BEFORE_LABEL
++        from omnigent.stores.conversation_store import (
++            FORK_CARRY_HISTORY_LABEL_KEY,
++            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
++        )
++
++        agent = native_coding_agent_for_harness(harness)
++        if harness not in {"codex-native", "claude-native"} or agent is None:
++            raise ValueError("Native fallback requires a supported harness")
++        if self._engine is not self._conv_engine:
++            raise NotImplementedError("Native fallback requires a single database")
++        now = now_epoch()
++        with self._conv_session_immediate("apply_native_fallback") as ap_sess:
++            statement = select(SqlConversation).where(
++                SqlConversation.workspace_id == current_workspace_id(),
++                SqlConversation.id == conversation_id,
++            )
++            if self._supports_for_update:
++                statement = statement.with_for_update()
++            row = ap_sess.execute(statement).scalar_one_or_none()
++            if row is None:
++                raise LookupError(f"conversation not found: {conversation_id!r}")
++            labels = _fetch_labels(ap_sess, conversation_id)
++            if labels.get(ATTEMPT_LABEL) != attempt_id:
++                meta = ap_sess.get(
++                    SqlConversationMetadata, (current_workspace_id(), conversation_id)
++                )
++                if meta is None or meta.external_session_id != expected_external_session_id:
++                    raise ValueError("Native fallback source session changed")
++                meta.external_session_id = None
++                meta.terminal_launch_args = json.dumps(terminal_launch_args)
++                overrides = _decode_session_overrides(row.session_overrides)
++                overrides.update(
++                    model_override=model,
++                    harness_override=harness,
++                    reasoning_effort=reasoning_effort,
++                )
++                row.session_overrides = _encode_session_overrides(overrides)
++                row.updated_at = now
++                ap_sess.execute(
++                    delete(SqlConversationLabel).where(
++                        SqlConversationLabel.workspace_id == current_workspace_id(),
++                        SqlConversationLabel.conversation_id == conversation_id,
++                        SqlConversationLabel.key == FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
++                    )
++                )
++                _upsert_labels(
++                    ap_sess,
++                    conversation_id,
++                    {
++                        ATTEMPT_LABEL: attempt_id,
++                        HISTORY_BEFORE_LABEL: history_before_item_id,
++                        FORK_CARRY_HISTORY_LABEL_KEY: "1",
++                        "omnigent.wrapper": agent.wrapper_label,
++                        "omnigent.ui": "terminal",
++                        "omnigent.codex_native.bypass_sandbox": "0",
++                    },
++                    now,
++                )
++        conv = self.get_conversation(conversation_id)
++        if conv is None:
++            raise LookupError(f"conversation not found: {conversation_id!r}")
++        return conv
++
+     def set_external_session_id(
+         self,
+         conversation_id: str,
+diff --git a/tests/runner/test_native_fallback_runtime.py b/tests/runner/test_native_fallback_runtime.py
+new file mode 100644
+index 000000000..22f11cb68
+--- /dev/null
++++ b/tests/runner/test_native_fallback_runtime.py
+@@ -0,0 +1,448 @@
++"""Exercise real runner event dispatch against a native injection transport."""
++
++from __future__ import annotations
++
++import asyncio
++import copy
++
++import pytest
++
++from omnigent.runner import create_runner_app
++from omnigent.spec.types import AgentSpec, ExecutorFallback, ExecutorSpec
++from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
++from tests.runner.helpers import NullServerClient
++
++
++def _spec(primary="model-a", harness="claude-native"):
++    return AgentSpec(
++        spec_version=1,
++        name="reviewer",
++        instructions="Keep all citations.",
++        executor=ExecutorSpec(
++            type="omnigent",
++            model=primary,
++            reasoning_effort="high",
++            config={"harness": harness},
++            fallbacks=[
++                ExecutorFallback("model-b", "claude-native", "medium"),
++                ExecutorFallback("model-c", "codex-native", "xhigh"),
++            ],
++        ),
++    )
++
++
++async def _settle(predicate):
++    for _ in range(200):
++        if predicate():
++            return
++        await asyncio.sleep(0.01)
++    assert predicate()
++
++
++def _failure(harness, external, turn):
++    return {
++        "type": "native_fallback_claim",
++        "data": {
++            "status": "failed",
++            "expected_external_session_id": external,
++            "native_failure": {
++                "harness": harness,
++                "external_session_id": external,
++                "turn_id": turn,
++                "kind": "model_unavailable",
++                "before_work": True,
++            },
++        },
++    }
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "primary_harness,last_harness",
++    [("claude-native", "codex-native"), ("codex-native", "claude-native")],
++)
++async def test_native_chain_replays_original_input_once_per_backup(
++    tmp_path, monkeypatch, primary_harness, last_harness
++):
++    from omnigent import claude_native_bridge, codex_native_bridge
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex")
++    original = _spec(harness=primary_harness)
++    original.executor.fallbacks[1] = ExecutorFallback("model-c", last_harness, "xhigh")
++
++    async def resolve(*_):
++        return original
++
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "r1"}}),
++            _sse({"type": "response.completed", "response": {"id": "r1"}}),
++        ]
++    )
++    pm = _FakeProcessManager(hc)
++    app = create_runner_app(
++        process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
++    )
++    content = [
++        {"type": "input_text", "text": "Review this source exactly."},
++        {
++            "type": "input_file",
++            "filename": "source.txt",
++            "file_data": "data:text/plain;base64,c291cmNl",
++        },
++    ]
++    async with _runner_client(app) as client:
++        response = await client.post(
++            "/v1/sessions/conv_fallback/events",
++            json={
++                "type": "message",
++                "agent_id": "agent_role",
++                "pending_input_id": "pending_1",
++                "content": content,
++                "instructions": "Use the supplied file.",
++            },
++        )
++        assert response.status_code == 202
++        await _settle(lambda: len(hc.posted_bodies) == 1)
++        await asyncio.sleep(0.02)
++        # The native forwarder commits the optimistic user bubble after injection.
++        await client.post(
++            "/v1/sessions/conv_fallback/events",
++            json={
++                "type": "native_input_committed",
++                "pending_input_id": "pending_1",
++                "persisted_item_id": "item_original",
++            },
++        )
++        for index, (harness, model, effort) in enumerate(
++            [("claude-native", "model-b", "medium"), (last_harness, "model-c", "xhigh")]
++        ):
++            source = primary_harness if index == 0 else "claude-native"
++            event = _failure(source, f"external_{index}", f"turn_{index}")
++            first, duplicate = await asyncio.gather(
++                client.post("/v1/sessions/conv_fallback/events", json=event),
++                client.post("/v1/sessions/conv_fallback/events", json=copy.deepcopy(event)),
++            )
++            decision = first.json()["fallback"]
++            assert duplicate.json()["fallback"]["attempt_id"] == decision["attempt_id"]
++            assert decision["history_before_item_id"] == "item_original"
++            started = await client.post(
++                "/v1/sessions/conv_fallback/events",
++                json={"type": "native_fallback_start", "attempt_id": decision["attempt_id"]},
++            )
++            assert started.json() == {"started": True}
++            await _settle(lambda expected=index + 2: len(hc.posted_bodies) == expected)
++            await asyncio.sleep(0.02)
++            replay = hc.posted_bodies[-1]
++            assert replay["model_override"] == model
++            assert replay["reasoning"] == {"effort": effort}
++            assert replay["content"] == content
++            assert "Keep all citations." in replay["instructions"]
++            assert "Use the supplied file." in replay["instructions"]
++            assert pm.get_client_calls[-1][1] == harness
++            assert (await client.post("/v1/sessions/conv_fallback/events", json=event)).json() == {
++                "ignored": True
++            }
++        exhausted = await client.post(
++            "/v1/sessions/conv_fallback/events",
++            json=_failure(last_harness, "external_2", "turn_2"),
++        )
++        assert exhausted.json()["declined"] is True
++        assert exhausted.json()["attempted_models"] == ["model-a", "model-b", "model-c"]
++        assert len(hc.posted_bodies) == 3
++        assert original.executor.model == "model-a"
++        assert original.executor.config["harness"] == primary_harness
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("proof", [False, None])
++async def test_no_work_proof_is_required(proof):
++    from omnigent.runner.native.fallback import NativeFallbackTurn
++
++    spec = _spec()
++    state = NativeFallbackTurn.capture(spec, spec, {"persisted_item_id": "input", "content": []})
++    assert state is not None
++    data = _failure("claude-native", "external", "turn")["data"]
++    data["native_failure"]["before_work"] = proof
++    assert state.claim(data) is None
++    assert state.attempted == ["model-a"]
++
++
++@pytest.mark.asyncio
++async def test_failure_can_claim_before_native_injection_ack_finishes(tmp_path, monkeypatch):
++    from omnigent import claude_native_bridge
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++    release = asyncio.Event()
++    entered = asyncio.Event()
++
++    class SlowFirstInjection(_ScriptedHarnessClient):
++        def stream(self, method, url, *, json, timeout):
++            inner = super().stream(method, url, json=json, timeout=timeout)
++            first = len(self.posted_bodies) == 1
++
++            class Context:
++                async def __aenter__(self):
++                    stream = await inner.__aenter__()
++                    if first:
++                        entered.set()
++                        await release.wait()
++                    return stream
++
++                async def __aexit__(self, *args):
++                    return await inner.__aexit__(*args)
++
++            return Context()
++
++    async def resolve(*_):
++        return _spec()
++
++    hc = SlowFirstInjection(
++        [
++            _sse({"type": "response.created", "response": {"id": "r1"}}),
++            _sse({"type": "response.completed", "response": {"id": "r1"}}),
++        ]
++    )
++    app = create_runner_app(
++        process_manager=_FakeProcessManager(hc),
++        spec_resolver=resolve,
++        server_client=NullServerClient(),
++    )
++    async with _runner_client(app) as client:
++        await client.post(
++            "/v1/sessions/fast_failure/events",
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "original",
++                "content": [{"type": "input_text", "text": "Review"}],
++            },
++        )
++        await asyncio.wait_for(entered.wait(), 2)
++        claim = await client.post(
++            "/v1/sessions/fast_failure/events", json=_failure("claude-native", "vendor", "turn")
++        )
++        token = claim.json()["fallback"]["attempt_id"]
++        started = await client.post(
++            "/v1/sessions/fast_failure/events",
++            json={"type": "native_fallback_start", "attempt_id": token},
++        )
++        assert started.json() == {"started": True}
++        assert len(hc.posted_bodies) == 1
++        release.set()
++        await _settle(lambda: len(hc.posted_bodies) == 2)
++        assert hc.posted_bodies[-1]["model_override"] == "model-b"
++
++
++@pytest.mark.asyncio
++async def test_new_input_invalidates_an_unstarted_claim(tmp_path, monkeypatch):
++    from omnigent import claude_native_bridge
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++
++    async def resolve(*_):
++        return _spec()
++
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "r1"}}),
++            _sse({"type": "response.completed", "response": {"id": "r1"}}),
++        ]
++    )
++    app = create_runner_app(
++        process_manager=_FakeProcessManager(hc),
++        spec_resolver=resolve,
++        server_client=NullServerClient(),
++    )
++    async with _runner_client(app) as client:
++        await client.post(
++            "/v1/sessions/replaced/events",
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "first",
++                "content": [{"type": "input_text", "text": "First"}],
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 1)
++        claim = await client.post(
++            "/v1/sessions/replaced/events", json=_failure("claude-native", "vendor", "turn")
++        )
++        token = claim.json()["fallback"]["attempt_id"]
++        await client.post(
++            "/v1/sessions/replaced/events",
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "second",
++                "content": [{"type": "input_text", "text": "Replace the request"}],
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 2)
++        rejected = await client.post(
++            "/v1/sessions/replaced/events",
++            json={"type": "native_fallback_start", "attempt_id": token},
++        )
++        assert rejected.status_code == 409
++        assert len(hc.posted_bodies) == 2
++
++
++@pytest.mark.asyncio
++async def test_abort_fences_started_token_and_cannot_stop_newer_input(tmp_path, monkeypatch):
++    from omnigent import claude_native_bridge
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++
++    async def resolve(*_):
++        return _spec()
++
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "r1"}}),
++            _sse({"type": "response.completed", "response": {"id": "r1"}}),
++        ]
++    )
++    pm = _FakeProcessManager(hc)
++    app = create_runner_app(
++        process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
++    )
++    async with _runner_client(app) as client:
++        await client.post(
++            "/v1/sessions/aborted/events",
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "first",
++                "content": [{"type": "input_text", "text": "First"}],
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 1)
++        failure = _failure("claude-native", "vendor", "turn")
++        token = (await client.post("/v1/sessions/aborted/events", json=failure)).json()[
++            "fallback"
++        ]["attempt_id"]
++        start = {"type": "native_fallback_start", "attempt_id": token}
++        await client.post("/v1/sessions/aborted/events", json=start)
++        await _settle(lambda: len(hc.posted_bodies) == 2)
++        abort = {"type": "native_fallback_abort", "attempt_id": token}
++        assert (await client.post("/v1/sessions/aborted/events", json=abort)).json() == {
++            "aborted": True
++        }
++        assert (await client.post("/v1/sessions/aborted/events", json=start)).status_code == 409
++        assert (await client.post("/v1/sessions/aborted/events", json=failure)).json() == {
++            "ignored": True
++        }
++        assert len(hc.posted_bodies) == 2
++        await client.post(
++            "/v1/sessions/aborted/events",
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "second",
++                "content": [{"type": "input_text", "text": "New input"}],
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 3)
++        prior_releases = list(pm.released)
++        assert (await client.post("/v1/sessions/aborted/events", json=abort)).json() == {
++            "aborted": False
++        }
++        assert pm.released == prior_releases
++
++
++@pytest.mark.asyncio
++async def test_waiting_input_survives_transition_abort_and_waits_for_cleanup(
++    tmp_path, monkeypatch
++):
++    from omnigent import claude_native_bridge
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++    transition_entered = asyncio.Event()
++    transition_cancelled = asyncio.Event()
++    cleanup_entered = asyncio.Event()
++    finish_cleanup = asyncio.Event()
++
++    class BlockingReleaseManager(_FakeProcessManager):
++        async def release(self, conversation_id):
++            await super().release(conversation_id)
++            if len(self.released) == 1:
++                transition_entered.set()
++                try:
++                    await asyncio.Event().wait()
++                finally:
++                    transition_cancelled.set()
++            elif len(self.released) == 2:
++                cleanup_entered.set()
++                await finish_cleanup.wait()
++
++    async def resolve(*_):
++        return _spec()
++
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "r1"}}),
++            _sse({"type": "response.completed", "response": {"id": "r1"}}),
++        ]
++    )
++    app = create_runner_app(
++        process_manager=BlockingReleaseManager(hc),
++        spec_resolver=resolve,
++        server_client=NullServerClient(),
++    )
++    async with _runner_client(app) as client:
++        url = "/v1/sessions/waiting_input/events"
++        await client.post(
++            url,
++            json={
++                "type": "message",
++                "agent_id": "role",
++                "persisted_item_id": "first",
++                "content": [{"type": "input_text", "text": "First"}],
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 1)
++        claim = await client.post(url, json=_failure("claude-native", "vendor", "turn"))
++        token = claim.json()["fallback"]["attempt_id"]
++        await client.post(url, json={"type": "native_fallback_start", "attempt_id": token})
++        await asyncio.wait_for(transition_entered.wait(), 2)
++        new_input = {
++            "type": "message",
++            "agent_id": "role",
++            "persisted_item_id": "second",
++            "content": [{"type": "input_text", "text": "New input"}],
++        }
++        # Cancelling a caller must still cancel its request, not shared recovery.
++        cancelled_caller = asyncio.create_task(client.post(url, json=new_input))
++        await asyncio.sleep(0.02)
++        assert not cancelled_caller.done()
++        cancelled_caller.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await cancelled_caller
++        assert not transition_cancelled.is_set()
++
++        waiting_input = asyncio.create_task(client.post(url, json=new_input))
++        await asyncio.sleep(0.02)
++        assert not waiting_input.done()
++        abort = asyncio.create_task(
++            client.post(url, json={"type": "native_fallback_abort", "attempt_id": token})
++        )
++        try:
++            await asyncio.wait_for(cleanup_entered.wait(), 2)
++            await asyncio.sleep(0.02)
++            assert transition_cancelled.is_set()
++            assert not waiting_input.done()
++            assert len(hc.posted_bodies) == 1
++        finally:
++            finish_cleanup.set()
++            responses = await asyncio.wait_for(
++                asyncio.gather(abort, waiting_input, return_exceptions=True), 2
++            )
++        assert responses[0].json() == {"aborted": True}
++        assert responses[1].status_code == 202
++        await _settle(lambda: len(hc.posted_bodies) == 2)
++        assert hc.posted_bodies[-1]["content"][-1] == {
++            "type": "message",
++            "role": "user",
++            "content": new_input["content"],
++        }
+diff --git a/tests/runner/test_native_fallback_state.py b/tests/runner/test_native_fallback_state.py
+new file mode 100644
+index 000000000..22af44fb5
+--- /dev/null
++++ b/tests/runner/test_native_fallback_state.py
+@@ -0,0 +1,174 @@
++"""A captured input has one bounded, identity-checked native fallback chain."""
++
++from __future__ import annotations
++
++from copy import deepcopy
++from dataclasses import asdict
++
++import pytest
++
++from omnigent.runner.native.fallback import NativeCandidate, NativeFallbackTurn, spec_for_candidate
++from omnigent.spec import AgentSpec, ExecutorFallback, ExecutorSpec
++
++
++def _spec() -> AgentSpec:
++    spec = AgentSpec(
++        spec_version=1,
++        name="writer",
++        instructions="Preserve source meaning.",
++        executor=ExecutorSpec(
++            model="primary",
++            reasoning_effort="xhigh",
++            config={"harness": "codex-native", "yolo": False},
++            fallbacks=[
++                ExecutorFallback("backup-one", "claude-native", "max"),
++                ExecutorFallback("backup-two", "claude-native", "max"),
++            ],
++        ),
++    )
++    spec.sub_agents = [
++        AgentSpec(spec_version=1, name="reader", instructions="Read independently.")
++    ]
++    spec.tools.agents = ["reader"]
++    return spec
++
++
++def _turn(**message) -> NativeFallbackTurn:
++    captured = NativeFallbackTurn.capture(
++        _spec(),
++        object(),
++        {
++            "persisted_item_id": "item-1",
++            "content": [{"type": "input_text", "text": "original"}],
++            **message,
++        },
++    )
++    assert captured is not None
++    return captured
++
++
++def _failure(
++    turn: NativeFallbackTurn, external: str = "native-1", native_turn: str = "turn-1"
++) -> dict:
++    return {
++        "expected_external_session_id": external,
++        "response_id": "response-1",
++        "native_failure": {
++            "before_work": True,
++            "kind": "rate_limit",
++            "harness": turn.selected.harness,
++            "model": turn.selected.model,
++            "external_session_id": external,
++            "turn_id": native_turn,
++        },
++    }
++
++
++def test_two_failures_use_ordered_backups_then_exhaust_without_cycle() -> None:
++    turn = _turn()
++    first = turn.claim(_failure(turn))
++    assert first["model"] == "backup-one"
++    assert first["reasoning_effort"] == "max"
++    assert first["history_before_item_id"] == "item-1"
++    second = turn.claim(_failure(turn, "native-2", "turn-2"))
++    assert second["model"] == "backup-two"
++    assert second["attempt_id"] != first["attempt_id"]
++    assert turn.claim(_failure(turn, "native-3", "turn-3")) is None
++    assert turn.closed
++    assert turn.attempted == ["primary", "backup-one", "backup-two"]
++
++
++def test_duplicate_claim_does_not_consume_another_candidate() -> None:
++    turn = _turn()
++    failure = _failure(turn)
++    first = turn.claim(failure)
++    assert turn.claim(failure) == first
++    assert turn.attempted == ["primary", "backup-one"]
++    turn.claim(_failure(turn, "native-2", "turn-2"))
++    assert turn.claim(failure) == {"ignored": True}
++    assert turn.attempted == ["primary", "backup-one", "backup-two"]
++
++
++@pytest.mark.parametrize(
++    ("key", "value"),
++    [
++        ("before_work", False),
++        ("before_work", "true"),
++        ("before_work", None),
++        ("kind", "authentication_failed"),
++        ("kind", "permission_denied"),
++        ("kind", "cancelled"),
++        ("kind", "unknown"),
++        ("harness", "claude-native"),
++        ("model", "other-model"),
++        ("external_session_id", "other-session"),
++        ("turn_id", None),
++    ],
++)
++def test_unsafe_or_unrelated_failure_leaves_chain_untouched(key: str, value: object) -> None:
++    turn = _turn()
++    failure = _failure(turn)
++    failure["native_failure"][key] = value
++    assert turn.claim(failure) is None
++    assert turn.selected.model == "primary"
++    assert len(turn.remaining) == 2
++    assert not turn.failures
++
++
++def test_active_response_and_closed_turn_are_checked() -> None:
++    turn = _turn()
++    turn.running_response_id = "another-response"
++    assert turn.claim(_failure(turn)) is None
++    turn.running_response_id = None
++    turn.closed = True
++    assert turn.claim(_failure(turn)) is None
++
++
++def test_pending_input_must_resolve_to_persisted_item_before_claim() -> None:
++    turn = NativeFallbackTurn.capture(_spec(), object(), {"pending_input_id": "pending-1"})
++    assert turn is not None
++    assert turn.claim(_failure(turn)) is None
++    turn.message["persisted_item_id"] = "resolved-item"
++    assert turn.claim(_failure(turn))["history_before_item_id"] == "resolved-item"
++    assert NativeFallbackTurn.capture(_spec(), object(), {}) is None
++
++
++def test_no_chain_or_non_native_executor_has_no_capture() -> None:
++    spec = _spec()
++    spec.executor.fallbacks = []
++    assert NativeFallbackTurn.capture(spec, None, {"persisted_item_id": "item"}) is None
++    spec = _spec()
++    spec.executor.config["harness"] = "claude-sdk"
++    assert NativeFallbackTurn.capture(spec, None, {"persisted_item_id": "item"}) is None
++
++
++def test_capture_freezes_original_input_and_current_backup_does_not_cycle() -> None:
++    message = {"persisted_item_id": "item", "content": ["original"]}
++    spec = _spec()
++    turn = NativeFallbackTurn.capture(spec, None, message)
++    message["content"].append("later")
++    spec.instructions = "later"
++    assert turn.message["content"] == ["original"]
++    assert turn.spec.instructions == "Preserve source meaning."
++    selected_backup = _turn(
++        model_override="backup-one", harness_override="claude-native", reasoning={"effort": "high"}
++    )
++    assert [candidate.model for candidate in selected_backup.remaining] == ["backup-two"]
++
++
++def test_candidate_preserves_role_instructions_tools_children_and_source() -> None:
++    spec = _spec()
++    before = deepcopy(spec)
++    changed = spec_for_candidate(spec, NativeCandidate("backup-one", "claude-native", "max"))
++    changed_fields, original_fields = asdict(changed), asdict(spec)
++    changed_fields.pop("executor")
++    original_fields.pop("executor")
++    assert changed_fields == original_fields
++    assert spec == before
++    assert changed.executor.model == "backup-one"
++    assert changed.executor.reasoning_effort == "max"
++    assert changed.executor.config["harness"] == "claude-native"
++    assert changed.executor.config["yolo"] is False
++    assert changed.executor.config["permission_mode"] not in ("bypassPermissions", "acceptEdits")
++    changed.sub_agents[0].instructions = "modified copy"
++    assert spec.sub_agents[0].instructions == "Read independently."
+diff --git a/tests/runner/test_session_resources.py b/tests/runner/test_session_resources.py
+index b2a99b7d6..43e990945 100644
+--- a/tests/runner/test_session_resources.py
++++ b/tests/runner/test_session_resources.py
+@@ -1570,6 +1570,9 @@ class _LaunchReturningRegistry:
+     def __init__(self, instance: TerminalInstance) -> None:
+         self._instance = instance
+ 
++    def get(self, conversation_id: str, terminal_name: str, session_key: str):
++        return self._instance
++
+     async def launch(
+         self,
+         *,
+@@ -2772,3 +2775,37 @@ async def test_terminal_exit_cleanup_evicts_only_the_exited_instance(tmp_path: P
+         "a successor registered under the same key must survive exit cleanup"
+     )
+     assert terminal_registry.get("conv_exit", "claude", "main") is successor
++
++
++@pytest.mark.asyncio
++async def test_retired_native_watcher_cannot_publish_status_for_replacement(
++    tmp_path: Path,
++) -> None:
++    """Queued and late old-pane edges cannot settle a replacement's turn."""
++    old_capture, new_capture = _WatcherCapture(), _WatcherCapture()
++    old = _make_capturing_instance(tmp_path, old_capture, name="claude", session_key="main")
++    new = _make_capturing_instance(tmp_path, new_capture, name="claude", session_key="main")
++    terminals = _LaunchReturningRegistry(old)
++    registry = SessionResourceRegistry(terminal_registry=terminals)
++    statuses = []
++    registry.set_session_status_publisher(lambda sid, status, reason=None: statuses.append(status))
++    for instance in (old, new):
++        terminals._instance = instance
++        await registry.launch_required_terminal(
++            session_id="conv_fallback",
++            terminal_name="claude",
++            session_key="main",
++            spec=_claude_terminal_spec(tmp_path),
++            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
++        )
++        if instance is old:
++            old_capture.on_idle()  # Queued before the replacement takes ownership.
++    new_capture.on_activity()
++    await asyncio.sleep(0)
++    assert statuses == ["running"]
++    old_capture.on_idle()  # The retired daemon thread is still draining callbacks.
++    await asyncio.sleep(0)
++    assert statuses == ["running"]
++    new_capture.on_idle()
++    await asyncio.sleep(0)
++    assert statuses == ["running", "idle"]
+diff --git a/tests/server/integration/test_native_fallback.py b/tests/server/integration/test_native_fallback.py
+new file mode 100644
+index 000000000..33641a918
+--- /dev/null
++++ b/tests/server/integration/test_native_fallback.py
+@@ -0,0 +1,330 @@
++"""Native provider failures traverse the real server and runner event routes."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++
++import httpx
++import pytest
++
++from omnigent.runner import create_runner_app
++from omnigent.runtime import pending_inputs
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient, _sse
++from tests.runner.helpers import NullServerClient
++from tests.runner.test_native_fallback_runtime import _settle, _spec
++from tests.server.helpers import create_test_agent
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("start_accepted", [True, False], ids=["start-ack", "failure-delivery"])
++async def test_new_message_waits_until_fallback_transition_is_delivered(
++    client, db_uri, monkeypatch, start_accepted
++):
++    """Input admission cannot supersede a claimed, persisted fallback mid-transition."""
++    from omnigent.server.routes import sessions
++
++    agent = await create_test_agent(client)
++    session_id = agent["_session_id"]
++    store = SqlAlchemyConversationStore(db_uri)
++    store.set_external_session_id(session_id, "native-old")
++    original = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={
++            "type": "external_conversation_item",
++            "data": {
++                "item_type": "message",
++                "item_data": {
++                    "role": "user",
++                    "content": [{"type": "input_text", "text": "Original request"}],
++                },
++            },
++        },
++    )
++    assert original.status_code == 202, original.text
++    original_item_id = original.json()["item_id"]
++    transition_paused = asyncio.Event()
++    release_transition = asyncio.Event()
++    message_attempted = asyncio.Event()
++    order = []
++    forwarded_messages = []
++
++    async def handle_runner(request):
++        body = json.loads(request.content)
++        if request.url.path.endswith("/resources/terminals"):
++            return httpx.Response(200, json={"terminal_id": "replacement-terminal"})
++        event_type = body["type"]
++        order.append(event_type)
++        if event_type == "native_fallback_claim":
++            return httpx.Response(
++                200,
++                json={
++                    "fallback": {
++                        "attempt_id": "attempt-1",
++                        "model": "backup-model",
++                        "harness": "claude-native",
++                        "reasoning_effort": "max",
++                        "previous_harness": "codex-native",
++                        "expected_external_session_id": "native-old",
++                        "history_before_item_id": original_item_id,
++                    }
++                },
++            )
++        if event_type == "native_fallback_start":
++            if not start_accepted:
++                return httpx.Response(409, json={"started": False})
++            transition_paused.set()
++            await release_transition.wait()
++            order.append("start_acknowledged")
++            return httpx.Response(200, json={"started": True})
++        if event_type == "external_session_status":
++            assert not start_accepted
++            assert body["data"]["status"] == "failed"
++            assert "captured input is no longer current" in body["data"]["output"]
++            transition_paused.set()
++            await release_transition.wait()
++            order.append("failure_delivered")
++            return httpx.Response(200, json={"queued": False})
++        assert event_type == "message", body
++        forwarded_messages.append(body)
++        return httpx.Response(202, json={"queued": True})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handle_runner), base_url="http://runner"
++    ) as runner_client:
++
++        async def runner_for(*_):
++            return runner_client
++
++        monkeypatch.setattr(sessions, "_get_runner_client", runner_for)
++        failure_task = asyncio.create_task(
++            client.post(
++                f"/v1/sessions/{session_id}/events",
++                json={
++                    "type": "external_session_status",
++                    "data": {
++                        "status": "failed",
++                        "output": "Primary model unavailable",
++                        "native_failure": {
++                            "harness": "codex-native",
++                            "external_session_id": "native-old",
++                            "turn_id": "old-turn",
++                            "kind": "model_unavailable",
++                            "before_work": True,
++                        },
++                    },
++                },
++            )
++        )
++        message_task = None
++        try:
++            await asyncio.wait_for(transition_paused.wait(), timeout=5)
++            # The switch is persisted; either the start ACK or failure delivery is pending.
++            assert store.get_conversation(session_id).model_override == "backup-model"
++
++            async def send_new_message():
++                message_attempted.set()
++                return await client.post(
++                    f"/v1/sessions/{session_id}/events",
++                    json={
++                        "type": "message",
++                        "data": {
++                            "role": "user",
++                            "content": [{"type": "input_text", "text": "New request"}],
++                        },
++                    },
++                )
++
++            message_task = asyncio.create_task(send_new_message())
++            await message_attempted.wait()
++            with pytest.raises(TimeoutError):
++                await asyncio.wait_for(asyncio.shield(message_task), timeout=0.1)
++            assert forwarded_messages == []
++            before_delivery = ["native_fallback_claim", "native_fallback_start"]
++            if not start_accepted:
++                before_delivery.append("external_session_status")
++            assert order == before_delivery
++
++            release_transition.set()
++            failure, message = await asyncio.wait_for(
++                asyncio.gather(failure_task, message_task), timeout=5
++            )
++            assert failure.status_code == 202, failure.text
++            expected_failure = {"queued": False}
++            if start_accepted:
++                expected_failure["native_fallback"] = True
++            assert failure.json() == expected_failure
++            assert message.status_code == 202, message.text
++            assert message.json()["queued"] is True
++            assert isinstance(message.json()["pending_id"], str)
++            assert order == [
++                *before_delivery,
++                "start_acknowledged" if start_accepted else "failure_delivered",
++                "message",
++            ]
++            assert forwarded_messages[0]["content"] == [
++                {"type": "input_text", "text": "New request"}
++            ]
++        finally:
++            release_transition.set()
++            tasks = [failure_task] + ([message_task] if message_task is not None else [])
++            for task in tasks:
++                if not task.done():
++                    task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failures", [1, 3])
++async def test_provider_failure_chain_has_one_terminal_delivery(
++    client, db_uri, monkeypatch, tmp_path, failures
++):
++    import omnigent.runner.app as runner_module
++    from omnigent import claude_native_bridge, codex_native_bridge
++    from omnigent.server.routes import sessions
++
++    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude")
++    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex")
++    agent = await create_test_agent(client)
++    session_id = agent["_session_id"]
++    store = SqlAlchemyConversationStore(db_uri)
++    store.set_external_session_id(session_id, "vendor_0")
++    store.set_labels(session_id, {"policy.keep": "required"})
++    original_spec = _spec()
++
++    async def resolve(*_):
++        return original_spec
++
++    hc = _ScriptedHarnessClient(
++        [
++            _sse({"type": "response.created", "response": {"id": "injection"}}),
++            _sse({"type": "response.completed", "response": {"id": "injection"}}),
++        ]
++    )
++    pm = _FakeProcessManager(hc)
++    runner = create_runner_app(
++        process_manager=pm, spec_resolver=resolve, server_client=NullServerClient()
++    )
++    terminal = []
++    actual_terminal = runner_module.mark_subagent_work_terminal
++
++    def record_terminal(sid, *, status, output):
++        terminal.append((sid, status, output))
++        return actual_terminal(sid, status=status, output=output)
++
++    monkeypatch.setattr(runner_module, "mark_subagent_work_terminal", record_terminal)
++    published = []
++    monkeypatch.setattr(
++        sessions.session_stream, "publish", lambda sid, event: published.append((sid, event))
++    )
++    async with _runner_client(runner) as runner_client:
++
++        async def runner_for(*_):
++            return runner_client
++
++        monkeypatch.setattr(sessions, "_get_runner_client", runner_for)
++        content = [{"type": "input_text", "text": "Review the supplied evidence."}]
++        pending_id = pending_inputs.record(session_id, content)
++        await runner_client.post(
++            f"/v1/sessions/{session_id}/events",
++            json={
++                "type": "message",
++                "agent_id": agent["id"],
++                "pending_input_id": pending_id,
++                "content": content,
++            },
++        )
++        await _settle(lambda: len(hc.posted_bodies) == 1)
++        committed = await client.post(
++            f"/v1/sessions/{session_id}/events",
++            json={
++                "type": "external_conversation_item",
++                "data": {
++                    "item_type": "message",
++                    "item_data": {"role": "user", "content": content},
++                },
++            },
++        )
++        assert committed.status_code == 202, committed.text
++        item_id = committed.json()["item_id"]
++        for index in range(failures):
++            harness = "codex-native" if index == 2 else "claude-native"
++            payload = {
++                "type": "external_session_status",
++                "data": {
++                    "status": "failed",
++                    "output": "Selected model is unavailable.",
++                    "native_failure": {
++                        "harness": harness,
++                        "external_session_id": f"vendor_{index}",
++                        "turn_id": f"turn_{index}",
++                        "kind": "model_unavailable",
++                        "before_work": True,
++                    },
++                },
++            }
++            # Duplicate provider terminal notifications must claim one attempt.
++            results = (
++                await asyncio.gather(
++                    client.post(f"/v1/sessions/{session_id}/events", json=payload),
++                    client.post(f"/v1/sessions/{session_id}/events", json=payload),
++                )
++                if index < 2
++                else [await client.post(f"/v1/sessions/{session_id}/events", json=payload)]
++            )
++            assert all(r.status_code == 202 for r in results), [r.text for r in results]
++            if index < 2:
++                assert all(r.json().get("native_fallback") is True for r in results)
++                await _settle(lambda expected=index + 2: len(hc.posted_bodies) == expected)
++                assert terminal == []
++                changed = store.get_conversation(session_id)
++                assert changed.agent_id == agent["id"]
++                assert changed.labels["policy.keep"] == "required"
++                assert changed.labels["omnigent.native_fallback.history_before_item_id"] == item_id
++                assert changed.model_override == ["model-b", "model-c"][index]
++                store.set_external_session_id(session_id, f"vendor_{index + 1}")
++                # An abandoned source cannot terminate the replacement, even
++                # when its late error lacks replay eligibility evidence.
++                old = await client.post(
++                    f"/v1/sessions/{session_id}/events",
++                    json={
++                        "type": "external_session_status",
++                        "data": {
++                            "status": "failed",
++                            "output": "Late old error",
++                            "native_source": {
++                                "harness": harness,
++                                "external_session_id": f"vendor_{index}",
++                            },
++                        },
++                    },
++                )
++                assert old.json().get("ignored") is True
++                assert terminal == []
++        if failures == 1:
++            done = await client.post(
++                f"/v1/sessions/{session_id}/events",
++                json={
++                    "type": "external_session_status",
++                    "data": {
++                        "status": "idle",
++                        "output": "Reviewed with citations.",
++                        "native_source": {
++                            "harness": "claude-native",
++                            "external_session_id": "vendor_1",
++                        },
++                    },
++                },
++            )
++            assert done.status_code == 202
++            assert [row[1] for row in terminal] == ["completed"]
++        else:
++            assert [row[1] for row in terminal] == ["failed"]
++            assert "model-a, model-b, model-c" in terminal[0][2]
++        failed = [
++            event
++            for _, event in published
++            if event.get("type") == "session.status" and event.get("status") == "failed"
++        ]
++        assert len(failed) == (1 if failures == 3 else 0)
+diff --git a/tests/server/test_native_fallback_coordinator.py b/tests/server/test_native_fallback_coordinator.py
+new file mode 100644
+index 000000000..1381cd360
+--- /dev/null
++++ b/tests/server/test_native_fallback_coordinator.py
+@@ -0,0 +1,180 @@
++"""Bounded coordinator retries distinguish confirmed starts from uncertain ones."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, Mock
++
++import pytest
++from starlette.responses import JSONResponse
++
++from omnigent.runner.native.fallback import ATTEMPT_LABEL
++from omnigent.server.routes.sessions.native_fallback import try_native_fallback
++
++
++def _context(*, external="native-old", attempt=None):
++    conv = SimpleNamespace(external_session_id=external, labels={}, terminal_launch_args=[])
++    if attempt is not None:
++        conv.labels[ATTEMPT_LABEL] = attempt
++    store = SimpleNamespace(get_conversation=Mock(return_value=conv), apply_native_fallback=Mock())
++    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
++    data = {
++        "status": "failed",
++        "response_id": "response-old",
++        "output": "Provider failed",
++        "native_failure": {
++            "external_session_id": "native-old",
++            "turn_id": "turn-old",
++            "harness": "codex-native",
++            "before_work": True,
++            "kind": "rate_limit",
++        },
++    }
++    return store, request, data
++
++
++def _claim():
++    return JSONResponse(
++        {
++            "fallback": {
++                "attempt_id": "attempt-1",
++                "model": "backup-model",
++                "harness": "claude-native",
++                "reasoning_effort": "max",
++                "previous_model": "primary-model",
++                "previous_harness": "codex-native",
++                "expected_external_session_id": "native-old",
++                "history_before_item_id": "original-input",
++            }
++        }
++    )
++
++
++async def _run(store, request, data, forward):
++    return await try_native_fallback(
++        session_id="session-1",
++        data=data,
++        request=request,
++        conversation_store=store,
++        runner_router=object(),
++        forward=forward,
++    )
++
++
++def _events(forward):
++    return [call.args[2] for call in forward.await_args_list]
++
++
++@pytest.mark.asyncio
++async def test_lost_first_start_ack_retries_same_token_and_commits_once():
++    store, request, data = _context()
++    forward = AsyncMock(side_effect=[_claim(), None, JSONResponse({"started": True})])
++    assert await _run(store, request, data, forward) is True
++    store.apply_native_fallback.assert_called_once()
++    events = _events(forward)
++    assert [event["type"] for event in events] == [
++        "native_fallback_claim",
++        "native_fallback_start",
++        "native_fallback_start",
++    ]
++    assert events[1] == events[2] == {"type": "native_fallback_start", "attempt_id": "attempt-1"}
++    applied = store.apply_native_fallback.call_args.kwargs
++    assert applied["model"] == "backup-model"
++    assert applied["reasoning_effort"] == "max"
++    assert applied["history_before_item_id"] == "original-input"
++    assert applied["terminal_launch_args"] == ["--permission-mode", "default"]
++
++
++@pytest.mark.asyncio
++async def test_two_unknown_start_acks_abort_same_token_and_expose_uncertainty():
++    store, request, data = _context()
++    forward = AsyncMock(side_effect=[_claim(), None, None, JSONResponse({"aborted": True})])
++    assert await _run(store, request, data, forward) is False
++    assert [event["type"] for event in _events(forward)] == [
++        "native_fallback_claim",
++        "native_fallback_start",
++        "native_fallback_start",
++        "native_fallback_abort",
++    ]
++    assert _events(forward)[-1]["attempt_id"] == "attempt-1"
++    assert "final outcome could not be confirmed" in data["output"]
++    store.apply_native_fallback.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_unreachable_abort_still_reports_uncertainty_after_bounded_attempts():
++    store, request, data = _context()
++    forward = AsyncMock(side_effect=[_claim(), None, None, None])
++    assert await _run(store, request, data, forward) is False
++    assert forward.await_count == 4
++    assert "where reachable" in data["output"]
++
++
++@pytest.mark.asyncio
++async def test_lost_start_ack_then_stale_token_is_visible_failure():
++    store, request, data = _context()
++    forward = AsyncMock(
++        side_effect=[_claim(), None, JSONResponse({"started": False}, status_code=409)]
++    )
++    assert await _run(store, request, data, forward) is False
++    assert "captured input is no longer current" in data["output"]
++    assert forward.await_count == 3
++    store.apply_native_fallback.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_old_source_with_persisted_replacement_identity_is_ignored():
++    store, request, data = _context(external="native-replacement", attempt="attempt-1")
++    forward = AsyncMock()
++    assert await _run(store, request, data, forward) is True
++    forward.assert_not_awaited()
++    store.apply_native_fallback.assert_not_called()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("claim_kind", ["lost", "declined", "malformed"])
++async def test_cleared_native_id_without_acknowledged_claim_is_not_ignored(claim_kind):
++    store, request, data = _context(external=None, attempt="attempt-1")
++    response = {
++        "lost": None,
++        "declined": JSONResponse({"declined": True}),
++        "malformed": JSONResponse(["unexpected"]),
++    }[claim_kind]
++    forward = AsyncMock(return_value=response)
++    assert await _run(store, request, data, forward) is False
++    assert forward.await_count == 1
++    store.apply_native_fallback.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_split_database_decline_never_starts_replacement():
++    store, request, data = _context()
++    store.apply_native_fallback.side_effect = NotImplementedError("single database required")
++    forward = AsyncMock(return_value=_claim())
++    assert await _run(store, request, data, forward) is False
++    assert forward.await_count == 1
++
++
++@pytest.mark.asyncio
++async def test_exhausted_chain_reports_all_attempted_models_without_start():
++    store, request, data = _context()
++    forward = AsyncMock(
++        return_value=JSONResponse(
++            {"declined": True, "attempted_models": ["primary", "backup-one", "backup-two"]}
++        )
++    )
++    assert await _run(store, request, data, forward) is False
++    assert "primary, backup-one, backup-two" in data["output"]
++    store.apply_native_fallback.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_read_only_cross_provider_constraint_is_preserved():
++    store, request, data = _context()
++    store.get_conversation.return_value.terminal_launch_args = ["--sandbox", "read-only"]
++    forward = AsyncMock(side_effect=[_claim(), JSONResponse({"started": True})])
++    assert await _run(store, request, data, forward) is True
++    assert store.apply_native_fallback.call_args.kwargs["terminal_launch_args"] == [
++        "--permission-mode",
++        "plan",
++    ]
+diff --git a/tests/spec/test_executor_fallbacks.py b/tests/spec/test_executor_fallbacks.py
+new file mode 100644
+index 000000000..a76867aa9
+--- /dev/null
++++ b/tests/spec/test_executor_fallbacks.py
+@@ -0,0 +1,160 @@
++"""Native fallback declarations survive both spec formats and reject unsafe chains."""
++
++from __future__ import annotations
++
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++import yaml
++
++from omnigent.errors import OmnigentError
++from omnigent.inner.loader import _parse_executor_spec
++from omnigent.spec import AgentSpec, ExecutorFallback, ExecutorSpec, parse, validate
++from omnigent.spec.omnigent import agent_def_to_agent_spec, agent_spec_to_agent_def
++
++
++def _spec() -> AgentSpec:
++    return AgentSpec(
++        spec_version=1,
++        name="fallback-test",
++        instructions="Keep the original instructions.",
++        executor=ExecutorSpec(
++            model="primary-test-model",
++            reasoning_effort="high",
++            config={"harness": "codex-native", "yolo": False},
++            fallbacks=[
++                ExecutorFallback("second-test-model", "claude-native", "max"),
++                ExecutorFallback("third-test-model", "codex-native", "high"),
++            ],
++        ),
++    )
++
++
++def test_bundle_load_retains_order_and_reasoning(tmp_path: Path) -> None:
++    (tmp_path / "config.yaml").write_text(
++        yaml.safe_dump(
++            {
++                "spec_version": 1,
++                "name": "fallback-test",
++                "executor": {
++                    "model": "primary-test-model",
++                    "config": {"harness": "codex-native", "yolo": False},
++                    "fallbacks": [
++                        {
++                            "model": "second-test-model",
++                            "harness": "claude-native",
++                            "reasoning_effort": "max",
++                        },
++                        {
++                            "model": "third-test-model",
++                            "harness": "codex-native",
++                            "reasoning_effort": "high",
++                        },
++                    ],
++                },
++            }
++        )
++    )
++    parsed = parse(tmp_path)
++    assert parsed.executor.fallbacks == _spec().executor.fallbacks
++    assert validate(parsed).valid
++    assert str(parsed.executor.config["yolo"]).lower() == "false"
++
++
++@pytest.mark.parametrize(
++    "raw",
++    [
++        "model",
++        {},
++        ["model"],
++        [None],
++        [{"model": "", "harness": "codex-native"}],
++        [{"model": 123, "harness": "codex-native"}],
++        [{"model": "bad model", "harness": "codex-native"}],
++        [{"model": "backup", "harness": "unknown"}],
++        [{"model": "backup", "harness": "codex-native", "reasoning_effort": 4}],
++        [{"model": "backup", "harness": "codex-native", "yolo": True}],
++        [{"model": "backup", "harness": "codex-native"}] * 3,
++    ],
++)
++def test_malformed_candidates_are_rejected_in_both_formats(tmp_path: Path, raw: object) -> None:
++    (tmp_path / "config.yaml").write_text(
++        yaml.safe_dump(
++            {
++                "spec_version": 1,
++                "name": "test",
++                "executor": {"fallbacks": raw},
++            }
++        )
++    )
++    with pytest.raises(OmnigentError, match=r"executor\.fallbacks"):
++        parse(tmp_path)
++    with pytest.raises(OmnigentError, match=r"executor\.fallbacks"):
++        _parse_executor_spec({"model": "primary", "harness": "codex-native", "fallbacks": raw})
++
++
++@pytest.mark.parametrize(
++    ("field", "value", "expected"),
++    [
++        ("model", None, "explicit primary"),
++        ("type", "agents_sdk", "native primary"),
++        ("config", {"harness": "claude-sdk"}, "native primary"),
++        ("connection", {"base_url": "https://example.test"}, "host-managed"),
++        ("profile", "credential-profile", "host-managed"),
++        ("config", {"harness": "codex-native", "profile": "credential-profile"}, "host-managed"),
++        ("fallbacks", [ExecutorFallback("primary-test-model", "codex-native")], "duplicates"),
++        ("fallbacks", [ExecutorFallback("backup", "claude-native")] * 2, "duplicates"),
++        ("fallbacks", [ExecutorFallback("backup", "claude-native")] * 3, "at most two"),
++        (
++            "fallbacks",
++            [ExecutorFallback("backup", "codex-native", "unsupported")],
++            "reasoning_effort",
++        ),
++        ("fallbacks", [ExecutorFallback("backup", "unsupported")], "harness"),
++    ],
++)
++def test_invalid_chains_fail_validation(field: str, value: object, expected: str) -> None:
++    spec = _spec()
++    spec.executor = replace(spec.executor, **{field: value})
++    errors = validate(spec).errors
++    assert any(
++        e.path.startswith("executor.fallbacks") and expected in (e.path + e.message)
++        for e in errors
++    )
++
++
++def test_default_empty_chain_preserves_old_specs() -> None:
++    spec = _spec()
++    spec.executor = replace(spec.executor, fallbacks=[])
++    assert validate(spec).valid
++    assert _parse_executor_spec("primary-test-model").fallbacks == []
++
++
++def test_primary_and_child_chains_survive_translation() -> None:
++    spec = _spec()
++    child = replace(_spec(), name="reader")
++    spec.sub_agents = [child]
++    spec.tools.agents = ["reader"]
++    translated = agent_spec_to_agent_def(spec)
++    restored = agent_def_to_agent_spec(translated)
++    assert restored.executor.fallbacks == spec.executor.fallbacks
++    assert restored.sub_agents[0].executor.fallbacks == child.executor.fallbacks
++    assert restored.instructions == spec.instructions
++
++
++def test_standalone_executor_chain_survives_translation() -> None:
++    inner = _parse_executor_spec(
++        {
++            "model": "primary-test-model",
++            "harness": "codex-native",
++            "fallbacks": [
++                {"model": "backup", "harness": "claude-native", "reasoning_effort": "max"}
++            ],
++        }
++    )
++    assert inner is not None
++    from omnigent.inner.datamodel import AgentDef
++
++    spec = agent_def_to_agent_spec(AgentDef(name="test", prompt="original", executor=inner))
++    assert spec.executor.fallbacks == inner.fallbacks
+diff --git a/tests/stores/test_native_fallback_store.py b/tests/stores/test_native_fallback_store.py
+new file mode 100644
+index 000000000..c7572319f
+--- /dev/null
++++ b/tests/stores/test_native_fallback_store.py
+@@ -0,0 +1,133 @@
++"""Native fallback selection commits atomically without replacing the role."""
++
++from __future__ import annotations
++
++from dataclasses import asdict
++from unittest.mock import patch
++from uuid import uuid4
++
++import pytest
++
++from omnigent.runner.native.fallback import ATTEMPT_LABEL, HISTORY_BEFORE_LABEL
++from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
++
++
++def _prepare(store, agent_store=None):
++    agent_id = None
++    if agent_store is not None:
++        agent_id = uuid4().hex
++        agent_store.create(agent_id, "original-role", "synthetic-bundle")
++    parent = store.create_conversation(title="parent")
++    conv = store.create_conversation(
++        kind="sub_agent",
++        title="reader",
++        agent_id=agent_id,
++        sub_agent_name="reader",
++        parent_conversation_id=parent.id,
++        terminal_launch_args=["--permission-mode", "manual"],
++    )
++    store.set_external_session_id(conv.id, "native-old")
++    store.set_labels(
++        conv.id,
++        {
++            "policy.keep": "denied-tools",
++            "custom": "preserve",
++            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY: "stale-source",
++            "omnigent.codex_native.bypass_sandbox": "1",
++        },
++    )
++    return store.get_conversation(conv.id)
++
++
++def _apply(store, conv_id: str, **changes):
++    args = {
++        "attempt_id": "attempt-1",
++        "expected_external_session_id": "native-old",
++        "model": "backup-one",
++        "harness": "claude-native",
++        "reasoning_effort": "max",
++        "history_before_item_id": "original-input",
++        "terminal_launch_args": ["--permission-mode", "plan"],
++    }
++    args.update(changes)
++    return store.apply_native_fallback(conv_id, **args)
++
++
++def test_commit_retains_role_parent_policy_and_exact_selection(
++    conversation_store, agent_store
++) -> None:
++    before = _prepare(conversation_store, agent_store)
++    after = _apply(conversation_store, before.id)
++    assert after.agent_id == before.agent_id
++    assert after.parent_conversation_id == before.parent_conversation_id
++    assert after.sub_agent_name == before.sub_agent_name
++    assert after.kind == before.kind
++    assert after.model_override == "backup-one"
++    assert after.harness_override == "claude-native"
++    assert after.reasoning_effort == "max"
++    assert after.external_session_id is None
++    assert after.terminal_launch_args == ["--permission-mode", "plan"]
++    assert after.labels[ATTEMPT_LABEL] == "attempt-1"
++    assert after.labels[HISTORY_BEFORE_LABEL] == "original-input"
++    assert after.labels["policy.keep"] == "denied-tools"
++    assert after.labels["custom"] == "preserve"
++    assert after.labels["omnigent.codex_native.bypass_sandbox"] == "0"
++    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in after.labels
++
++
++def test_duplicate_attempt_does_not_clear_replacement_native_session(conversation_store) -> None:
++    before = _prepare(conversation_store)
++    _apply(conversation_store, before.id)
++    conversation_store.set_external_session_id(before.id, "native-new")
++    once = conversation_store.get_conversation(before.id)
++    twice = _apply(conversation_store, before.id)
++    assert asdict(twice) == asdict(once)
++
++
++def test_stale_source_identity_cannot_mutate_existing_selection(conversation_store) -> None:
++    before = _prepare(conversation_store)
++    with pytest.raises(ValueError, match="source session changed"):
++        _apply(conversation_store, before.id, expected_external_session_id="wrong-source")
++    assert asdict(conversation_store.get_conversation(before.id)) == asdict(before)
++
++
++def test_failed_label_write_rolls_back_native_id_and_selection_then_can_retry(
++    conversation_store,
++) -> None:
++    before = _prepare(conversation_store)
++    with patch(
++        "omnigent.stores.conversation_store.sqlalchemy_store._upsert_labels",
++        side_effect=RuntimeError("simulated write failure"),
++    ):
++        with pytest.raises(RuntimeError, match="simulated write failure"):
++            _apply(conversation_store, before.id)
++    assert asdict(conversation_store.get_conversation(before.id)) == asdict(before)
++    assert _apply(conversation_store, before.id).model_override == "backup-one"
++
++
++def test_second_attempt_uses_replacement_native_id_and_preserves_original_boundary(
++    conversation_store,
++) -> None:
++    before = _prepare(conversation_store)
++    _apply(conversation_store, before.id)
++    conversation_store.set_external_session_id(before.id, "native-new")
++    with pytest.raises(ValueError, match="source session changed"):
++        _apply(conversation_store, before.id, attempt_id="attempt-2", model="backup-two")
++    after = _apply(
++        conversation_store,
++        before.id,
++        attempt_id="attempt-2",
++        model="backup-two",
++        expected_external_session_id="native-new",
++    )
++    assert after.external_session_id is None
++    assert after.model_override == "backup-two"
++    assert after.labels[HISTORY_BEFORE_LABEL] == "original-input"
++
++
++def test_split_database_declines_before_mutation(split_db_conversation_store) -> None:
++    store = split_db_conversation_store
++    before = _prepare(store)
++    with pytest.raises(NotImplementedError, match="single database"):
++        _apply(store, before.id)
++    assert asdict(store.get_conversation(before.id)) == asdict(before)
+diff --git a/tests/test_claude_failure_evidence.py b/tests/test_claude_failure_evidence.py
+new file mode 100644
+index 000000000..bd0c89729
+--- /dev/null
++++ b/tests/test_claude_failure_evidence.py
+@@ -0,0 +1,260 @@
++"""Use actual transcript response identities for safe Claude recovery evidence."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from copy import deepcopy
++from pathlib import Path
++
++import httpx
++import pytest
++
++from omnigent import claude_native_forwarder as forwarder
++from omnigent.claude_native_bridge import read_transcript_items_since, record_hook_event
++from omnigent.native_failure_evidence import claude_failure_evidence
++
++SESSION = "claude-test-session"
++ERROR_TEXT = "API Error: provider temporarily unavailable"
++
++
++def _user(uuid: str = "user-1") -> dict:
++    return {
++        "type": "user",
++        "uuid": uuid,
++        "sessionId": SESSION,
++        "message": {"role": "user", "content": "Write a short note."},
++    }
++
++
++def _api_error(uuid: str = "error-1", parent: str = "user-1") -> dict:
++    return {
++        "type": "assistant",
++        "uuid": uuid,
++        "parentUuid": parent,
++        "sessionId": SESSION,
++        "isApiErrorMessage": True,
++        "message": {"role": "assistant", "content": [{"type": "text", "text": ERROR_TEXT}]},
++    }
++
++
++def _write(path: Path, rows: list[dict]) -> Path:
++    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
++    return path
++
++
++def _response(source: str) -> str:
++    return "resp_claude_" + hashlib.sha256(source.encode()).hexdigest()[:32]
++
++
++def _evidence(path: Path, **overrides) -> dict | None:
++    options = {
++        "error": "overloaded",
++        "transcript_path": path,
++        "external_session_id": SESSION,
++        "response_id": _response("error-1"),
++        "last_assistant_message": ERROR_TEXT,
++        "model": "approved-model",
++    }
++    options.update(overrides)
++    return claude_failure_evidence(**options)
++
++
++@pytest.fixture(autouse=True)
++def _isolated_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
++    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path)
++
++
++def test_evidence_matches_real_first_assistant_response_identity(tmp_path: Path) -> None:
++    path = _write(tmp_path / "transcript.jsonl", [_user(), _api_error(), _api_error("error-2")])
++    _, response_id, _ = read_transcript_items_since(path, 0, agent_name="reader")
++    assert response_id == _response("error-1")
++    assert response_id != _response("user-1")
++    evidence = _evidence(path, response_id=response_id)
++    assert evidence == {
++        "harness": "claude-native",
++        "turn_id": "user-1",
++        "external_session_id": SESSION,
++        "kind": "provider_unavailable",
++        "before_work": True,
++        "model": "approved-model",
++    }
++
++
++@pytest.mark.parametrize("error", ["authentication_failed", "permission_denied", "unknown", None])
++def test_nonavailability_error_never_allows_replay(tmp_path: Path, error: str | None) -> None:
++    path = _write(tmp_path / "transcript.jsonl", [_user(), _api_error()])
++    assert _evidence(path, error=error) is None
++
++
++@pytest.mark.parametrize(
++    "variant",
++    [
++        "ordinary_assistant",
++        "tool",
++        "reasoning",
++        "new_user",
++        "tool_result",
++        "malformed",
++        "missing_parent",
++        "wrong_parent",
++        "wrong_session",
++        "duplicate_user",
++        "empty_error",
++        "meta_user",
++        "compaction",
++        "unknown_record",
++    ],
++)
++def test_work_or_ambiguous_turn_never_allows_replay(tmp_path: Path, variant: str) -> None:
++    rows = [_user(), _api_error()]
++    if variant == "ordinary_assistant":
++        rows[1].pop("isApiErrorMessage")
++    elif variant in ("tool", "reasoning"):
++        rows[1]["message"]["content"] = [
++            {
++                "type": "tool_use" if variant == "tool" else "thinking",
++                "text": "work",
++            }
++        ]
++    elif variant == "new_user":
++        rows.append(_user("user-2"))
++    elif variant == "tool_result":
++        result = _user("result-1")
++        result["message"]["content"] = [{"type": "tool_result", "tool_use_id": "tool-1"}]
++        rows.append(result)
++    elif variant == "malformed":
++        rows[1]["message"]["content"] = ["text"]
++    elif variant == "missing_parent":
++        rows[1].pop("parentUuid")
++    elif variant == "wrong_parent":
++        rows[1]["parentUuid"] = "earlier-turn-user"
++    elif variant == "wrong_session":
++        rows[0]["sessionId"] = "other-session"
++    elif variant == "duplicate_user":
++        rows.insert(0, deepcopy(rows[0]))
++    elif variant == "empty_error":
++        rows[1]["message"]["content"] = []
++    elif variant == "meta_user":
++        rows[0]["isMeta"] = True
++    elif variant == "compaction":
++        rows[0]["isCompactSummary"] = True
++    else:
++        rows.append({"type": "unknown"})
++    path = _write(tmp_path / "transcript.jsonl", rows)
++    assert _evidence(path) is None
++
++
++@pytest.mark.parametrize(
++    "response_id", [None, "unrelated-response", _response("user-1"), _response("error-2")]
++)
++def test_other_response_identity_cannot_authorize_replay(
++    tmp_path: Path, response_id: str | None
++) -> None:
++    path = _write(tmp_path / "transcript.jsonl", [_user(), _api_error(), _api_error("error-2")])
++    assert _evidence(path, response_id=response_id) is None
++
++
++def test_actual_work_before_api_error_cannot_hide_behind_error_message(tmp_path: Path) -> None:
++    work = _api_error("work-1")
++    work.pop("isApiErrorMessage")
++    work["message"]["content"] = [{"type": "text", "text": "I changed the document."}]
++    path = _write(tmp_path / "transcript.jsonl", [_user(), work, _api_error(parent="work-1")])
++    assert _evidence(path, response_id=_response("work-1")) is None
++
++
++def test_hook_message_requires_exact_proven_api_error_text(tmp_path: Path) -> None:
++    path = _write(tmp_path / "transcript.jsonl", [_user(), _api_error()])
++    assert _evidence(path, last_assistant_message="I updated the file.") is None
++    assert _evidence(path, last_assistant_message=None) is not None
++
++
++def test_no_assistant_requires_positive_user_identity(tmp_path: Path) -> None:
++    path = _write(tmp_path / "transcript.jsonl", [_user()])
++    assert _evidence(path, response_id=None, last_assistant_message=None) is None
++    assert (
++        _evidence(path, response_id=_response("user-1"), last_assistant_message=None) is not None
++    )
++
++
++@pytest.mark.parametrize("raw", [b'{"type":"user"}', b"{broken}\n", b"null\n", b"\xff\n"])
++def test_incomplete_or_malformed_transcript_never_proves_no_work(
++    tmp_path: Path, raw: bytes
++) -> None:
++    path = tmp_path / "transcript.jsonl"
++    path.write_bytes(raw)
++    assert _evidence(path) is None
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("work_before_error", [False, True])
++async def test_real_transcript_and_stopfailure_forwarding_propagates_only_safe_evidence(
++    tmp_path: Path,
++    work_before_error: bool,
++) -> None:
++    rows = [_user()]
++    if work_before_error:
++        work = _api_error("work-1")
++        work.pop("isApiErrorMessage")
++        work["message"]["content"] = [{"type": "text", "text": "Already wrote something."}]
++        rows.append(work)
++    rows.append(_api_error(parent="work-1" if work_before_error else "user-1"))
++    transcript = _write(tmp_path / "transcript.jsonl", rows)
++    bridge_dir = tmp_path / "bridge"
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "StopFailure",
++            "session_id": SESSION,
++            "transcript_path": str(transcript),
++            "error": "overloaded",
++            "error_details": "Provider unavailable",
++            "last_assistant_message": ERROR_TEXT,
++        },
++    )
++    posts = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        posts.append(json.loads(request.content))
++        return httpx.Response(200, json={})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://test"
++    ) as client:
++        dedupe = forwarder._ForwardDedupeState()
++        state = await forwarder._forward_available_items(
++            client=client,
++            session_id="conv-test",
++            bridge_dir=bridge_dir,
++            agent_name="reader",
++            state=forwarder.TranscriptForwardState(transcript, 0),
++            retry_tracker=forwarder._PostRetryTracker(),
++            dedupe=dedupe,
++        )
++        # Resume history may retain the previous model before any new output.
++        dedupe.observed_model = "previous-model"
++        await forwarder._forward_available_status_events(
++            client=client,
++            session_id="conv-test",
++            bridge_dir=bridge_dir,
++            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
++            retry_tracker=forwarder._PostRetryTracker(),
++            dedupe=dedupe,
++            task_subjects={},
++            task_statuses={},
++            task_order=[],
++            response_id=state.current_response_id,
++        )
++    statuses = [post["data"] for post in posts if post.get("type") == "external_session_status"]
++    assert len(statuses) == 1
++    status = statuses[0]
++    assert status["status"] == "failed"
++    assert status["response_id"] == _response("work-1" if work_before_error else "error-1")
++    assert status["output"] == "Provider unavailable"
++    if work_before_error:
++        assert "native_failure" not in status
++    else:
++        assert status["native_failure"]["turn_id"] == "user-1"
++        assert status["native_failure"]["before_work"] is True
++        assert "model" not in status["native_failure"]
+diff --git a/tests/test_claude_native_forwarder.py b/tests/test_claude_native_forwarder.py
+index 0fccb96af..7e22c1012 100644
+--- a/tests/test_claude_native_forwarder.py
++++ b/tests/test_claude_native_forwarder.py
+@@ -1465,7 +1465,15 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
+     # no background tasks) so a finished shell clears the indicator.
+     assert request["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "idle", "background_task_count": 0},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "claude-session",
++                "turn_id": None,
++            },
++            "status": "idle",
++            "background_task_count": 0,
++        },
+     }
+ 
+ 
+@@ -1549,7 +1557,14 @@ async def test_forwarder_ignores_subagent_stop_failure_hook(
+ 
+     assert first["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "failed"},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "parent-session",
++                "turn_id": None,
++            },
++            "status": "failed",
++        },
+     }
+ 
+ 
+@@ -1631,7 +1646,15 @@ async def test_forwarder_ignores_subagent_stop_hook(
+ 
+     assert first["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "idle", "background_task_count": 0},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "parent-session",
++                "turn_id": None,
++            },
++            "status": "idle",
++            "background_task_count": 0,
++        },
+     }
+ 
+ 
+@@ -1930,7 +1953,14 @@ async def test_forwarder_does_not_post_compaction_on_non_compact_session_start(
+     assert request["path"] == "/v1/sessions/conv_abc/events"
+     assert request["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "failed"},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "claude-session",
++                "turn_id": None,
++            },
++            "status": "failed",
++        },
+     }
+ 
+ 
+@@ -2143,7 +2173,14 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
+ 
+     assert request["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "failed"},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "claude-session",
++                "turn_id": None,
++            },
++            "status": "failed",
++        },
+     }
+ 
+ 
+@@ -2940,7 +2977,14 @@ async def test_forwarder_migrates_hook_cursor_state_to_byte_offset(tmp_path: Pat
+ 
+     assert request["body"] == {
+         "type": "external_session_status",
+-        "data": {"status": "failed"},
++        "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "claude-session",
++                "turn_id": None,
++            },
++            "status": "failed",
++        },
+     }
+     assert state["event_cursor"] == 2
+     assert state["byte_offset"] == (bridge_dir / "hooks.jsonl").stat().st_size
+@@ -3128,6 +3172,11 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
+     # server surfaces it as the failure detail) and the turn's response id so
+     # it closes the streaming turn instead of leaving its tool cards spinning.
+     assert requests[-1]["data"] == {
++        "native_source": {
++            "harness": "claude-native",
++            "external_session_id": None,
++            "turn_id": requests[0]["data"]["response_id"],
++        },
+         "status": "failed",
+         "output": "transcript item poison-item:0:message rejected",
+         "response_id": requests[0]["data"]["response_id"],
+@@ -8150,6 +8199,11 @@ async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
+     assert request["body"] == {
+         "type": "external_session_status",
+         "data": {
++            "native_source": {
++                "harness": "claude-native",
++                "external_session_id": "claude-session",
++                "turn_id": None,
++            },
+             "status": "idle",
+             "background_task_count": 1,
+             # Per-shell detail rides alongside the count so the UI can name the
+@@ -8252,6 +8306,11 @@ async def test_forward_status_events_stamps_response_id_on_idle(tmp_path: Path)
+             # background-shell tally (0 here — no shells); the live-tool-card
+             # and background-task features share this one status edge.
+             "data": {
++                "native_source": {
++                    "harness": "claude-native",
++                    "external_session_id": "claude-session",
++                    "turn_id": "resp_turn_1",
++                },
+                 "status": "idle",
+                 "background_task_count": 0,
+                 "response_id": "resp_turn_1",
+diff --git a/tests/test_codex_failure_evidence.py b/tests/test_codex_failure_evidence.py
+new file mode 100644
+index 000000000..a0d052bdb
+--- /dev/null
++++ b/tests/test_codex_failure_evidence.py
+@@ -0,0 +1,156 @@
++"""Replay evidence is emitted only for identifiable pre-work provider failures."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import httpx
++import pytest
++
++from omnigent import codex_native_forwarder as fwd
++from omnigent.codex_native_bridge import CodexNativeBridgeState, write_bridge_state
++from omnigent.native_failure_evidence import codex_availability_kind
++
++
++@pytest.mark.parametrize(
++    ("info", "expected"),
++    [
++        ("usageLimitExceeded", "rate_limit"),
++        ("rateLimitExceeded", "rate_limit"),
++        ("modelNotFound", "model_unavailable"),
++        ("serverOverloaded", "provider_unavailable"),
++        ("internalServerError", "provider_unavailable"),
++        ({"responseTooManyFailedAttempts": {"httpStatusCode": 503}}, "provider_unavailable"),
++        ("unauthorized", None),
++        ("badRequest", None),
++        ({"httpStatusCode": 503}, "provider_unavailable"),
++        ({"httpConnectionFailed": {"httpStatusCode": 429}}, "rate_limit"),
++        ({"httpStatusCode": 401}, None),
++        ({"httpStatusCode": 403}, None),
++        ("contextWindowExceeded", None),
++        ("policyDenied", None),
++        ("unknown", None),
++    ],
++)
++def test_only_known_availability_errors(info: object, expected: str | None) -> None:
++    assert codex_availability_kind({"codexErrorInfo": info}) == expected
++
++
++def _params(*, items: list[dict[str, object]] | None = None) -> dict[str, object]:
++    turn: dict[str, object] = {
++        "id": "turn-one",
++        "status": "failed",
++        "error": {"message": "Quota exhausted", "codexErrorInfo": "usageLimitExceeded"},
++    }
++    if items is not None:
++        turn["items"] = items
++    return {"threadId": "thread-one", "turn": turn}
++
++
++def test_missing_activity_history_does_not_imply_safe_replay() -> None:
++    params = _params()
++    error = fwd._terminal_error_from_turn(params)
++    assert fwd._codex_failure_evidence(params, error, fwd._CodexForwarderState()) is None
++    assert fwd._codex_failure_evidence(params, error, None) is None
++
++
++@pytest.mark.parametrize(
++    "item_type", ["agentMessage", "commandExecution", "reasoning", "mcpToolCall"]
++)
++def test_complete_turn_with_any_work_is_not_replayed(item_type: str) -> None:
++    params = _params(items=[{"type": "userMessage"}, {"type": item_type}])
++    assert fwd._codex_failure_evidence(params, fwd._terminal_error_from_turn(params), None) is None
++
++
++def test_completed_empty_turn_proves_no_work_after_reconnect() -> None:
++    params = _params(items=[])
++    evidence = fwd._codex_failure_evidence(params, fwd._terminal_error_from_turn(params), None)
++    assert evidence is not None
++    assert evidence["turn_id"] == "turn-one"
++    assert evidence["external_session_id"] == "thread-one"
++
++
++@pytest.mark.parametrize(
++    "method, payload",
++    [
++        ("item/agentMessage/delta", {"delta": "partial output"}),
++        ("item/started", {"item": {"type": "commandExecution"}}),
++        ("item/reasoning/textDelta", {"delta": "reasoning"}),
++        ("turn/plan/updated", {"plan": []}),
++    ],
++)
++def test_observed_work_overrides_incomplete_terminal_item_list(method: str, payload: dict) -> None:
++    state = fwd._CodexForwarderState()
++    fwd._note_fallback_activity("turn/started", _params(), state)
++    fwd._note_fallback_activity(method, {"turnId": "turn-one", **payload}, state)
++    # A duplicate start must not erase evidence of work.
++    fwd._note_fallback_activity("turn/started", _params(), state)
++    params = _params(items=[])
++    assert (
++        fwd._codex_failure_evidence(params, fwd._terminal_error_from_turn(params), state) is None
++    )
++
++
++@pytest.mark.parametrize("terminal_method", ["error", "turn/completed", "turn/failed"])
++async def test_real_forwarder_posts_safe_failure_metadata(
++    tmp_path: Path, terminal_method: str
++) -> None:
++    write_bridge_state(
++        tmp_path,
++        CodexNativeBridgeState(
++            session_id="conversation",
++            socket_path=str(tmp_path / "app.sock"),
++            thread_id="thread-one",
++            codex_home=str(tmp_path / "codex-home"),
++        ),
++    )
++    posts = []
++
++    def transport(request: httpx.Request) -> httpx.Response:
++        if request.method == "POST":
++            posts.append(json.loads(request.content))
++        return httpx.Response(200, json={})
++
++    async with httpx.AsyncClient(
++        base_url="http://test", transport=httpx.MockTransport(transport)
++    ) as client:
++        state = fwd._CodexForwarderState(model="configured-test-model")
++        usage = fwd._SessionUsageCoalescer(client, "conversation")
++        tracker = fwd._CodexElicitationTaskTracker()
++
++        async def send(method: str, params: dict) -> None:
++            await fwd._handle_event(
++                client,
++                session_id="conversation",
++                bridge_dir=tmp_path,
++                event={"method": method, "params": params},
++                usage_coalescer=usage,
++                elicitation_tracker=tracker,
++                expected_thread_id="thread-one",
++                forwarder_state=state,
++            )
++
++        await send("turn/started", {"threadId": "thread-one", "turn": {"id": "turn-one"}})
++        if terminal_method == "error":
++            params = {
++                "threadId": "thread-one",
++                "turnId": "turn-one",
++                "willRetry": False,
++                "error": {"message": "Quota exhausted", "codexErrorInfo": "usageLimitExceeded"},
++            }
++            await send("error", {**params, "willRetry": True})
++            assert not any(p.get("data", {}).get("status") == "failed" for p in posts)
++        else:
++            params = _params(items=[])
++        await send(terminal_method, params)
++        failures = [p["data"] for p in posts if p.get("data", {}).get("status") == "failed"]
++        assert len(failures) == 1
++        assert failures[0]["native_failure"] == {
++            "harness": "codex-native",
++            "turn_id": "turn-one",
++            "external_session_id": "thread-one",
++            "kind": "rate_limit",
++            "before_work": True,
++            "model": "configured-test-model",
++        }
+diff --git a/tests/test_codex_native_forwarder.py b/tests/test_codex_native_forwarder.py
+index 84359ede5..61a89ec21 100644
+--- a/tests/test_codex_native_forwarder.py
++++ b/tests/test_codex_native_forwarder.py
+@@ -1131,6 +1131,11 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
+             {
+                 "type": "external_session_status",
+                 "data": {
++                    "native_source": {
++                        "harness": "codex-native",
++                        "external_session_id": "thread_123",
++                        "turn_id": "turn_123",
++                    },
+                     "status": "failed",
+                     "response_id": "codex_turn_123",
+                     "output": "You've hit your usage limit.",
+@@ -1225,6 +1230,11 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path:
+             {
+                 "type": "external_session_status",
+                 "data": {
++                    "native_source": {
++                        "harness": "codex-native",
++                        "external_session_id": "thread_123",
++                        "turn_id": "turn_123",
++                    },
+                     "status": "failed",
+                     "response_id": "codex_turn_123",
+                     "output": "You've hit your usage limit.",
+diff --git a/tests/test_native_recovery_history.py b/tests/test_native_recovery_history.py
+new file mode 100644
+index 000000000..a025070a3
+--- /dev/null
++++ b/tests/test_native_recovery_history.py
+@@ -0,0 +1,164 @@
++"""Recovery carries only history preceding the one input it will retry."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import httpx
++import pytest
++
++from omnigent import claude_native, codex_native
++
++THREAD_ID = "019e96aa-0be2-7343-8d3b-6f914d60936b"
++
++
++def _message(item_id: str, text: str) -> dict:
++    return {
++        "id": item_id,
++        "type": "message",
++        "role": "user",
++        "content": [{"type": "input_text", "text": text}],
++    }
++
++
++@pytest.fixture(autouse=True)
++def _isolated_native_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "claude-projects")
++    monkeypatch.setattr("omnigent.claude_native_bridge._TRUSTED_PARENT", tmp_path)
++    monkeypatch.setattr("omnigent.claude_native_bridge._BRIDGE_ROOT", tmp_path / "claude-bridge")
++
++
++async def _rebuild(harness: str, client: httpx.AsyncClient, tmp_path: Path) -> Path | None:
++    kwargs = {
++        "session_id": "conv_recovery",
++        "external_session_id": THREAD_ID,
++        "workspace": tmp_path / "workspace",
++        "history_before_item_id": "retry-input",
++    }
++    if harness == "codex":
++        return await codex_native._ensure_local_codex_resume_rollout(
++            client,
++            **kwargs,
++            codex_home=tmp_path / "codex-home",
++            model_provider="openai",
++            codex_path=None,
++        )
++    return await claude_native._ensure_local_claude_resume_transcript(client, **kwargs)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("harness", ["codex", "claude"])
++async def test_recovery_history_is_exclusive_after_complete_paginated_fetch(
++    harness: str,
++    tmp_path: Path,
++) -> None:
++    pages = [
++        [_message("prior-input", "earlier completed context")],
++        [
++            _message("retry-input", "retry exactly once"),
++            _message("later-input", "must not leak into recovered history"),
++        ],
++    ]
++    requests = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        requests.append(request)
++        assert request.url.path == "/v1/sessions/conv_recovery/items"
++        page = 0 if request.url.params.get("after") is None else 1
++        return httpx.Response(
++            200,
++            json={
++                "data": pages[page],
++                "has_more": page == 0,
++                "last_id": "prior-input",
++            },
++        )
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://test"
++    ) as client:
++        path = await _rebuild(harness, client, tmp_path)
++
++    assert len(requests) == 2
++    assert path is not None
++    text = path.read_text()
++    assert "earlier completed context" in text
++    assert "retry exactly once" not in text
++    assert "must not leak" not in text
++    assert all(isinstance(json.loads(line), dict) for line in text.splitlines())
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("harness", ["codex", "claude"])
++@pytest.mark.parametrize("duplicate", [False, True])
++async def test_recovery_rejects_missing_or_ambiguous_boundary_without_writing(
++    harness: str,
++    duplicate: bool,
++    tmp_path: Path,
++) -> None:
++    items = [_message("prior-input", "earlier context")]
++    if duplicate:
++        items += [_message("retry-input", "one"), _message("retry-input", "two")]
++    transport = httpx.MockTransport(
++        lambda request: httpx.Response(200, json={"data": items, "has_more": False})
++    )
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        with pytest.raises(ValueError, match="exactly one committed item"):
++            await _rebuild(harness, client, tmp_path)
++    assert not list(tmp_path.rglob("*.jsonl"))
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("harness", ["codex", "claude"])
++async def test_empty_exclusive_prefix_requires_fresh_launch_without_writing(
++    harness: str,
++    tmp_path: Path,
++) -> None:
++    transport = httpx.MockTransport(
++        lambda request: httpx.Response(
++            200,
++            json={
++                "data": [_message("retry-input", "first task input")],
++                "has_more": False,
++            },
++        )
++    )
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        assert await _rebuild(harness, client, tmp_path) is None
++    assert not list(tmp_path.rglob("*.jsonl"))
++
++
++@pytest.mark.asyncio
++async def test_bounded_codex_recovery_rejects_existing_unbounded_rollout(tmp_path: Path) -> None:
++    existing = codex_native._codex_resume_rollout_path(tmp_path / "codex-home", THREAD_ID)
++    existing.parent.mkdir(parents=True)
++    original = b'{"type":"response_item","payload":{"text":"failed input"}}\n'
++    existing.write_bytes(original)
++
++    def unexpected_request(request: httpx.Request) -> httpx.Response:
++        raise AssertionError("Existing rollout must be rejected before use")
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(unexpected_request), base_url="http://test"
++    ) as client:
++        with pytest.raises(ValueError, match="fresh external session id"):
++            await _rebuild("codex", client, tmp_path)
++    assert existing.read_bytes() == original
++
++
++@pytest.mark.asyncio
++async def test_bounded_claude_recovery_never_uses_stale_local_transcript(tmp_path: Path) -> None:
++    existing = (
++        claude_native._claude_project_dir_for_cwd(tmp_path / "workspace") / f"{THREAD_ID}.jsonl"
++    )
++    existing.parent.mkdir(parents=True)
++    original = b'{"type":"user","message":{"role":"user","content":"failed input"}}\n'
++    existing.write_bytes(original)
++    transport = httpx.MockTransport(
++        lambda request: httpx.Response(500, json={"error": "unavailable"})
++    )
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        with pytest.raises(claude_native._ResumeHistoryUnavailableError):
++            await _rebuild("claude", client, tmp_path)
++    assert existing.read_bytes() == original

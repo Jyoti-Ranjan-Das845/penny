@@ -1,0 +1,8 @@
+2026-09-18T07:47:15.555017Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 4 items in this shard
+....                                                                     [100%]
+========================= Top tests by peak-RSS delta ==========================
++  136.2 MB  (now    136.2 MB)  tests/runner/test_session_resources.py::test_claude_native_terminal_drives_session_status_from_pane_activity
++    0.0 MB  (now    136.3 MB)  tests/runner/test_session_resources.py::test_retired_native_watcher_cannot_publish_status_for_replacement
++    0.0 MB  (now    136.2 MB)  tests/runner/test_session_resources.py::test_generic_terminal_does_not_drive_session_status
+4 passed, 48 deselected in 0.06s

@@ -1,0 +1,4 @@
+2026-09-18T08:04:39.689439Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 1 items in this shard
+.                                                                        [100%]
+1 passed, 2 deselected in 0.84s

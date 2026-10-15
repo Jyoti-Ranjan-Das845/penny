@@ -1,0 +1,204 @@
+2026-09-18T07:48:42.609917Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 1 items in this shard
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________ test_reset_state_rematerializes_env_from_new_agent_spec ____________
+
+tmp_path = PosixPath('/private/var/folders/lg/mrv1kkgx3_n5404ljr06mxgr0000gp/T/pytest-of-Pradeep.Das/pytest-23/test_reset_state_rematerialize0')
+
+    @pytest.mark.asyncio
+    async def test_reset_state_rematerializes_env_from_new_agent_spec(tmp_path: Path) -> None:
+        """``POST /reset-state`` makes the next filesystem access resolve the
+        NEW agent's spec — and therefore its ``os_env`` / sandbox.
+    
+        Regression guard for the in-place agent-switch sandbox fix. The web
+        filesystem/shell endpoints materialize the primary OSEnv from the
+        resolved agent spec (cached in ``_session_spec_cache``, keyed via the
+        snapshot's ``agent_id``). ``compute_default_env_root`` is handed that
+        same resolved spec, so capturing its argument tells us which agent is
+        live. Without the cache invalidation in ``reset-state``, the second
+        GET would still see ``agent_a`` (the bug: the env rebuilds from the
+        stale old spec and the new sandbox never applies). The flip to
+        ``agent_b`` proves the new agent's os_env now governs these endpoints.
+        """
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+    
+        # Two agents with DISTINCT sandboxes so the captured spec is unambiguous.
+        spec_a = AgentSpec(
+            spec_version=1,
+            name="agent_a",
+            os_env=OSEnvSpec(type="caller_process", cwd=".", sandbox=OSEnvSandboxSpec(type="none")),
+        )
+        spec_b = AgentSpec(
+            spec_version=1,
+            name="agent_b",
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+            ),
+        )
+    
+        async def _spec_resolver(agent_id: str, session_id: str | None) -> AgentSpec:
+            """Resolve agent_a→spec_a, agent_b→spec_b (the switch target)."""
+            del session_id
+            return spec_a if agent_id == "agent_a" else spec_b
+    
+        terminal_registry = TerminalRegistry(conversation_link_base_url="http://127.0.0.1:8000")
+        registry = SessionResourceRegistry(
+            terminal_registry=terminal_registry,
+            runner_workspace=workspace,
+            per_session_workspace=False,
+        )
+        # Capture the resolved spec each time the env root is computed without
+        # disturbing the real resolution logic.
+        captured_specs: list[Any] = []
+        _orig_compute_root = registry.compute_default_env_root
+    
+        def _recording_compute_root(session_id: str, agent_spec: Any) -> str | None:
+            """Record the resolved spec, then delegate to the real method."""
+            captured_specs.append(agent_spec)
+            return _orig_compute_root(session_id, agent_spec)
+    
+        registry.compute_default_env_root = _recording_compute_root  # type: ignore[method-assign]
+    
+        server = _SwitchableServerClient(str(workspace.resolve()))
+        app = create_runner_app(
+            server_client=server,  # type: ignore[arg-type]
+            terminal_registry=terminal_registry,
+            resource_registry=registry,
+            spec_resolver=_spec_resolver,
+            runner_workspace=workspace,
+            per_session_workspace=False,
+        )
+    
+        env_path = f"/v1/sessions/conv_switch/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as c:
+            resp1 = await c.get(env_path)
+            assert resp1.status_code == 200, resp1.text
+            # First access resolved agent_a (sandbox=none). A different value here
+            # would mean spec resolution is broken, not the switch path.
+            assert captured_specs[-1].name == "agent_a"
+            assert captured_specs[-1].os_env.sandbox.type == "none"
+    
+            # Simulate the in-place switch: rebind the conversation to agent_b on
+            # the server, then run the switch's runner-side reset.
+            server.agent_id = "agent_b"
+            reset = await c.post("/v1/sessions/conv_switch/reset-state")
+            assert reset.status_code == 200, reset.text
+            assert reset.json()["reset"] is True
+    
+>           resp2 = await c.get(env_path)
+                    ^^^^^^^^^^^^^^^^^^^^^
+
+tests/runner/test_session_resources.py:619: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1768: in get
+    return await self.request(
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1540: in request
+    return await self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1629: in send
+    response = await self._send_handling_auth(
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1657: in _send_handling_auth
+    response = await self._send_handling_redirects(
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1694: in _send_handling_redirects
+    response = await self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_client.py:1730: in _send_single_request
+    response = await transport.handle_async_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/httpx/_transports/asgi.py:170: in handle_async_request
+    await self.app(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/applications.py:1159: in __call__
+    await super().__call__(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/applications.py:90: in __call__
+    await self.middleware_stack(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py:186: in __call__
+    raise exc
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/middleware/errors.py:164: in __call__
+    await self.app(scope, receive, _send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py:63: in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app
+    raise exc
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app
+    await app(scope, receive, sender)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py:18: in __call__
+    await self.app(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/routing.py:660: in __call__
+    await self.middleware_stack(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/routing.py:680: in app
+    await route.handle(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/routing.py:276: in handle
+    await self.app(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/routing.py:134: in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py:53: in wrapped_app
+    raise exc
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py:42: in wrapped_app
+    await app(scope, receive, sender)
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/routing.py:120: in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/routing.py:674: in app
+    raw_response = await run_endpoint_function(
+../../../aiv/workbench/omnigent-penny-fallback/.venv/lib/python3.12/site-packages/fastapi/routing.py:328: in run_endpoint_function
+    return await dependant.call(**values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+omnigent/runner/app.py:9106: in get_session_environment
+    metadata["reachable"] = _environment_reach(root, agent_spec)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+omnigent/runner/app.py:9069: in _environment_reach
+    policy = resolve_sandbox(spec_os_env, root_path)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+omnigent/inner/sandbox.py:489: in resolve_sandbox
+    return _get_backend(sandbox_spec.type).resolve(spec, cwd)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <omnigent.inner.bwrap_sandbox.BwrapSandboxBackend object at 0x10ffcc7a0>
+spec = OSEnvSpec(type='caller_process', cwd='.', sandbox=OSEnvSandboxSpec(type='linux_bwrap', read_paths=None, write_paths=No...egress_rules=None, egress_allow_private_destinations=False, credential_proxy=None), fork=False, start_in_scratch=False)
+cwd = PosixPath('/private/var/folders/lg/mrv1kkgx3_n5404ljr06mxgr0000gp/T/pytest-of-Pradeep.Das/pytest-23/test_reset_state_rematerialize0/workspace')
+
+    def resolve(self, spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
+        """
+        Build a :class:`SandboxPolicy` for the bwrap backend.
+    
+        Three resolver behaviors specific to this backend:
+    
+        - ``write_paths`` defaults to **empty** — cwd is read-only
+          unless the spec sets ``write_paths: ["."]`` explicitly.
+        - ``cwd_allow_hidden`` falls back to
+          :data:`_DEFAULT_CWD_ALLOW_HIDDEN` when the spec doesn't
+          declare one.
+        - The bwrap binary must be on ``PATH`` or the resolver fails
+          loud with an install hint — no silent fallback.
+    
+        :param spec: The agent's :class:`OSEnvSpec`. ``spec.sandbox``
+            is read for backend tunables; the rest of the spec is
+            unused by this backend.
+        :param cwd: Effective working directory of the helper, e.g.
+            the project root. Used to resolve relative entries in
+            ``read_paths`` / ``write_paths`` / ``write_files``.
+        :returns: A populated :class:`SandboxPolicy` ready to be
+            consumed by :meth:`wrap_launcher_argv` and
+            :meth:`activate`.
+        :raises OSError: If the host is not Linux or the ``bwrap``
+            binary cannot be located.
+        """
+        sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+    
+        if os.name != "posix" or not sys.platform.startswith("linux"):
+>           raise OSError(
+                "linux_bwrap sandbox is only available on Linux. "
+                "Configure os_env.sandbox.type='none' on other OSes."
+            )
+E           OSError: linux_bwrap sandbox is only available on Linux. Configure os_env.sandbox.type='none' on other OSes.
+
+omnigent/inner/bwrap_sandbox.py:314: OSError
+=========================== short test summary info ============================
+FAILED tests/runner/test_session_resources.py::test_reset_state_rematerializes_env_from_new_agent_spec
+1 failed in 0.31s

@@ -1,0 +1,13 @@
+2026-09-18T07:58:47.552426Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 11 items in this shard
+...........                                                              [100%]
+========================= Top tests by peak-RSS delta ==========================
++  137.6 MB  (now    137.6 MB)  tests/server/test_native_fallback_coordinator.py::test_lost_first_start_ack_retries_same_token_and_commits_once
++    0.0 MB  (now    137.7 MB)  tests/server/test_native_fallback_coordinator.py::test_cleared_native_id_without_acknowledged_claim_is_not_ignored[declined]
++    0.0 MB  (now    137.6 MB)  tests/server/test_native_fallback_coordinator.py::test_two_unknown_start_acks_abort_same_token_and_expose_uncertainty
++    0.0 MB  (now    137.7 MB)  tests/server/test_native_fallback_coordinator.py::test_cleared_native_id_without_acknowledged_claim_is_not_ignored[malformed]
++    0.0 MB  (now    137.6 MB)  tests/server/test_native_fallback_coordinator.py::test_unreachable_abort_still_reports_uncertainty_after_bounded_attempts
++    0.0 MB  (now    137.6 MB)  tests/server/test_native_fallback_coordinator.py::test_lost_start_ack_then_stale_token_is_visible_failure
++    0.0 MB  (now    137.7 MB)  tests/server/test_native_fallback_coordinator.py::test_split_database_decline_never_starts_replacement
++    0.0 MB  (now    137.8 MB)  tests/server/test_native_fallback_coordinator.py::test_exhausted_chain_reports_all_attempted_models_without_start
+11 passed in 0.08s

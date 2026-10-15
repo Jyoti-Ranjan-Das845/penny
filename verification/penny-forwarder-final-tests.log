@@ -1,0 +1,41 @@
+2026-09-18T07:41:13.950662Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 662 items in this shard
+........................................................................ [ 10%]
+........................................................................ [ 21%]
+........................................................................ [ 32%]
+........................................................................ [ 43%]
+........................................................................ [ 54%]
+........................................................................ [ 65%]
+........................................................................ [ 76%]
+........................................................................ [ 87%]
+........................................................................ [ 97%]
+..............                                                           [100%]
+========================= Top tests by peak-RSS delta ==========================
++  147.2 MB  (now    147.2 MB)  tests/test_codex_failure_evidence.py::test_only_known_availability_errors[usageLimitExceeded-rate_limit]
++    7.1 MB  (now    157.0 MB)  tests/test_claude_native_forwarder.py::test_forwarder_posts_visible_transcript_items
++    6.7 MB  (now    167.6 MB)  tests/test_claude_native_forwarder.py::test_persist_native_compaction_item_posts_compaction_event
++    5.3 MB  (now    177.2 MB)  tests/test_claude_native_forwarder.py::test_forward_loop_deadline_unsticks_a_stalled_iteration
++    3.3 MB  (now    171.7 MB)  tests/test_claude_native_forwarder.py::test_failed_boundary_post_is_retried_not_consumed
++    1.5 MB  (now    180.0 MB)  tests/test_claude_native_bridge.py::test_channel_server_relays_active_omnigent_tools
++    1.2 MB  (now    159.8 MB)  tests/test_claude_native_forwarder.py::test_forwarder_skips_user_item_on_ambiguous_post_failure
++    1.2 MB  (now    148.6 MB)  tests/test_codex_native_forwarder.py::test_elicitation_post_reposts_after_transport_cut_with_same_envelope
++    1.1 MB  (now    178.3 MB)  tests/test_claude_native_bridge.py::test_cycleable_permission_modes_match_the_server_patch_vocabulary
++    0.7 MB  (now    160.8 MB)  tests/test_claude_native_forwarder.py::test_supervise_forwarder_backoff_grows_on_repeated_crashes
++    0.7 MB  (now    149.4 MB)  tests/test_codex_native_forwarder.py::test_completed_context_compaction_item_clears_spinner
++    0.7 MB  (now    157.6 MB)  tests/test_claude_native_forwarder.py::test_forwarder_mirrors_interrupt_marker_for_ui
++    0.7 MB  (now    158.3 MB)  tests/test_claude_native_forwarder.py::test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit
++    0.3 MB  (now    168.1 MB)  tests/test_claude_native_forwarder.py::test_compaction_completed_triggers_persist
++    0.2 MB  (now    168.3 MB)  tests/test_claude_native_forwarder.py::test_compaction_in_progress_does_not_persist
++    0.2 MB  (now    160.0 MB)  tests/test_claude_native_forwarder.py::test_forwarder_retries_user_item_on_connect_error
++    0.2 MB  (now    180.4 MB)  tests/test_claude_native_bridge.py::test_hook_evaluate_endpoint_allows
++    0.1 MB  (now    158.6 MB)  tests/test_claude_native_forwarder.py::test_forwarder_survives_unhandled_loop_exceptions
++    0.1 MB  (now    167.8 MB)  tests/test_claude_native_forwarder.py::test_persist_native_compaction_item_empty_items_uses_fallback
++    0.1 MB  (now    171.8 MB)  tests/test_claude_native_forwarder.py::test_ambiguous_boundary_post_marks_persisted
+================================== slow tests ==================================
+[slow] 26.12s tests/test_claude_native_bridge.py::test_curl_evaluate_policy_command_round_trips
+[slow] 3.39s tests/test_claude_native_bridge.py::test_inject_user_message_ignores_prompt_glyph_in_scrollback
+[slow] 2.07s tests/test_claude_native_bridge.py::test_set_permission_mode_raises_when_footer_never_renders
+[slow] 1.82s tests/test_claude_native_bridge.py::test_hook_evaluate_endpoint_fails_closed_on_unreachable_upstream
+[slow] 1.02s tests/test_claude_native_forwarder.py::test_forwarder_ignores_subagent_stop_failure_hook
+[slow] 1.01s tests/test_claude_native_forwarder.py::test_forwarder_ignores_subagent_stop_hook
+662 passed in 72.46s (0:01:12)

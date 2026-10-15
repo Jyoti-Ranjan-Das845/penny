@@ -1,0 +1,12 @@
+{
+  "models": [
+    {
+      "id": "fable",
+      "model": "claude-fable-5-1"
+    },
+    {
+      "id": "opus",
+      "model": "claude-opus-5"
+    }
+  ]
+}

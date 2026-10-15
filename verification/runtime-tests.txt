@@ -1,0 +1,45 @@
+Native fallback runtime verification
+Recorded: 2026-09-18
+Workspace: /Users/Pradeep.Das/Spaces/aiv/workbench/omnigent-penny-fallback
+
+Completed test command (no rerun for this report):
+.venv/bin/pytest tests/runner/test_native_fallback_runtime.py tests/server/integration/test_native_fallback.py -x -q
+
+Result: 9 passed in 96.31s
+This result was observed in the command output. No separate raw pytest log was saved.
+
+Final abort/admission gate regression rerun:
+.venv/bin/pytest tests/runner/test_native_fallback_runtime.py -x -q > release/delivery-evidence/runtime-race-regression.log 2>&1
+Result: 8 passed in 66.56s (0:01:06)
+Raw final log: runtime-race-regression-final.log (moved into this delivery-evidence folder after completion).
+The first rerun had seven passing cases and a final test-fixture assertion failure: the fake transport includes prior conversation history. That assertion was corrected to inspect the final user message; the production cancellation/barrier assertions already passed. The superseded failed output is retained locally outside this release.
+The added regression proves a canceled caller does not cancel shared recovery, and a different waiting input survives recovery cancellation, waits for abort cleanup to finish, and is injected once.
+Ruff check and format check passed after the fix; app.py Pyrefly remained at 0 errors (6 existing warnings).
+
+Covered scenarios:
+- Both approved harness orders: Claude -> Claude -> Codex and Codex -> Claude -> Claude.
+- At most two configured backups; ordered candidate selection and terminal exhaustion.
+- Exact resolved input, attachments, and instructions preserved; original role specification retained.
+- Optimistic pending input correlated with its persisted native user item before replay.
+- Eligible provider failure arriving before the original input transport acknowledges completion.
+- Duplicate failure/start handling and obsolete vendor status suppression.
+- Newer input invalidates an unstarted claim; token-scoped abort fences a started attempt without stopping newer input.
+- Real server event routes connected to real runner routes with a fake provider injection boundary.
+- Successful recovery and exhausted recovery each deliver one final terminal result to the parent.
+
+Static verification already completed:
+- Ruff: all owned changed runtime, server, store, and test files passed.
+- .venv/bin/pyrefly check omnigent/runner/app.py omnigent/runner/native/fallback.py omnigent/server/routes/sessions/native_fallback.py --output-format=min-text
+  Result: 0 errors; 6 existing warnings.
+- git diff --check: passed.
+
+Known limits:
+- These tests use a fake provider boundary. They do not establish live vendor outage recovery or live model execution.
+- Automatic recovery requires explicit structured proof of a supported availability failure before assistant output or tool activity. Authentication, policy, cancellation, context, unknown, and post-work failures do not trigger replay.
+- Recovery captures the original resolved input in runner memory. Missing capture after restart or unmatched terminal-only input is not automatically replayed.
+- A replacement startup, history conversion, or unsettled original transport failure ends visibly; it does not blindly advance to another model.
+- Persistent updates are atomic only when conversation data and metadata share the same engine/database. Split-database configurations decline before mutation.
+- If two start acknowledgments remain unavailable, the coordinator attempts a token-scoped abort and exposes an explicit uncertain outcome. An unreachable runner cannot be claimed to have stopped, and no further automatic replay is attempted.
+- The attempt budget is the primary model plus up to two configured backups; there is no additional same-model transient retry.
+
+Other suites are reported separately. The four failures from the earlier broader native model-catalog run were subsequently compared against a clean base checkout: all four reproduce with identical assertion locations and output. Endpoint rows contain provider source metadata omitted by the expected test rows. Final checkout: 4 failed in 60.31s; clean base 44378d68869120134d0a2663277e38af108f625d: 4 failed in 60.41s. See the catalog comparison report for the targeted commands and source provenance.

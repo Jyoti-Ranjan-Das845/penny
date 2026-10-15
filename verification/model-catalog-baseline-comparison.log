@@ -1,0 +1,52 @@
+Baseline comparison: baseline
+Working directory: /var/folders/lg/mrv1kkgx3_n5404ljr06mxgr0000gp/T/penny-model-catalog-baseline-6ko5z4hq/baseline
+Command: ["/Users/Pradeep.Das/Spaces/aiv/workbench/omnigent-penny-fallback/.venv/bin/python", "-m", "pytest", "tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[unset-keeps-codex-default]", "tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[launch-model-wins]", "tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_use_session_launch_catalog", "tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_serves_probe_rows_after_pending", "-q", "--tb=short", "--show-capture=no"]
+Imported package: /private/var/folders/lg/mrv1kkgx3_n5404ljr06mxgr0000gp/T/penny-model-catalog-baseline-6ko5z4hq/baseline/omnigent/__init__.py
+2026-09-18T08:17:23.055167Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 4 items in this shard
+2026-09-18T08:17:23.247758Z [info     ] native-codex routing: Codex CLI login (subscription provider 'codex'; Codex is logged in) [omnigent.codex_native_app_server]
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_ test_codex_native_model_options_query_model_list[unset-keeps-codex-default] __
+tests/runner/test_app_sessions_native_events_lifecycle.py:1018: in test_codex_native_model_options_query_model_list
+    assert resp.json() == {"models": expected_models}
+E   AssertionError: assert {'models': [{...-mini', ...}]} == {'models': [{...-mini', ...}]}
+E     
+E     Differing items:
+E     {'models': [{'defaultReasoningEffort': 'high', 'displayName': 'GPT-5.5', 'id': 'gpt-5.5', 'isDefault': True, ...}, {'d...oningEffort': 'medium', 'displayName': 'GPT-5.4 mini', 'id': 'gpt-5.4-mini', 'model': 'databricks-gpt-5-4-mini', ...}]} != {'models': [{'defaultReasoningEffort': 'high', 'displayName': 'GPT-5.5', 'id': 'gpt-5.5', 'isDefault': True, ...}, {'d...oningEffort': 'medium', 'displayName': 'GPT-5.4 mini', 'id': 'gpt-5.4-mini', 'model': 'databricks-gpt-5-4-mini', ...}]}
+E     Use -v to get more diff
+_____ test_codex_native_model_options_query_model_list[launch-model-wins] ______
+tests/runner/test_app_sessions_native_events_lifecycle.py:1018: in test_codex_native_model_options_query_model_list
+    assert resp.json() == {"models": expected_models}
+E   AssertionError: assert {'models': [{...: True, ...}]} == {'models': [{...: True, ...}]}
+E     
+E     Differing items:
+E     {'models': [{'defaultReasoningEffort': 'high', 'displayName': 'GPT-5.5', 'id': 'gpt-5.5', 'model': 'databricks-gpt-5-5....}, {'defaultReasoningEffort': 'medium', 'displayName': 'GPT-5.4 mini', 'id': 'gpt-5.4-mini', 'isDefault': True, ...}]} != {'models': [{'defaultReasoningEffort': 'high', 'displayName': 'GPT-5.5', 'id': 'gpt-5.5', 'model': 'databricks-gpt-5-5....}, {'defaultReasoningEffort': 'medium', 'displayName': 'GPT-5.4 mini', 'id': 'gpt-5.4-mini', 'isDefault': True, ...}]}
+E     Use -v to get more diff
+_________ test_claude_native_model_options_use_session_launch_catalog __________
+tests/runner/test_app_sessions_native_events_lifecycle.py:1145: in test_claude_native_model_options_use_session_launch_catalog
+    assert first.json() == expected
+E   AssertionError: assert {'models': [{...: 'claude'}}]} == {'models': [{...-haiku-4-5'}]}
+E     
+E     Differing items:
+E     {'models': [{'displayName': 'Opus 4.10', 'id': 'opus', 'isDefault': True, 'model': 'system.ai.claude-opus-4-10', ...},...'model': 'system.ai.claude-haiku-4-5', 'source': {'kind': 'subscription', 'label': 'Subscription', 'name': 'claude'}}]} != {'models': [{'displayName': 'Opus 4.10', 'id': 'opus', 'isDefault': True, 'model': 'system.ai.claude-opus-4-10'}, {'displayName': 'Haiku 4.5', 'id': 'haiku', 'model': 'system.ai.claude-haiku-4-5'}]}
+E     Use -v to get more diff
+_______ test_claude_native_model_options_serves_probe_rows_after_pending _______
+tests/runner/test_app_sessions_native_events_lifecycle.py:1262: in test_claude_native_model_options_serves_probe_rows_after_pending
+    assert resolved.json() == {
+E   AssertionError: assert {'models': [{...-4-10', ...}]} == {'models': [{...-opus-4-10'}]}
+E     
+E     Differing items:
+E     {'models': [{'id': 'sonnet[1m]', 'model': 'claude-sonnet-5[1m]', 'source': {'kind': 'subscription', 'label': 'Subscrip...claude-opus-4-10', 'id': 'system.ai.claude-opus-4-10', 'isDefault': True, 'model': 'system.ai.claude-opus-4-10', ...}]} != {'models': [{'id': 'sonnet[1m]', 'model': 'claude-sonnet-5[1m]'}, {'displayName': 'system.ai.claude-opus-4-10', 'id': 'system.ai.claude-opus-4-10', 'isDefault': True, 'model': 'system.ai.claude-opus-4-10'}]}
+E     Use -v to get more diff
+========================= Top tests by peak-RSS delta ==========================
++  172.1 MB  (now    172.1 MB)  tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[unset-keeps-codex-default]
++    0.6 MB  (now    172.7 MB)  tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[launch-model-wins]
++    0.4 MB  (now    173.1 MB)  tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_use_session_launch_catalog
++    0.2 MB  (now    173.3 MB)  tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_serves_probe_rows_after_pending
+=========================== short test summary info ============================
+FAILED tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[unset-keeps-codex-default]
+FAILED tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_model_options_query_model_list[launch-model-wins]
+FAILED tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_use_session_launch_catalog
+FAILED tests/runner/test_app_sessions_native_events_lifecycle.py::test_claude_native_model_options_serves_probe_rows_after_pending
+4 failed in 60.41s (0:01:00)

@@ -1,0 +1,14 @@
+2026-09-18T08:07:45.734218Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 9 items in this shard
+.........                                                                [100%]
+========================= Top tests by peak-RSS delta ==========================
++  180.2 MB  (now    180.2 MB)  tests/server/integration/test_sessions_endpoints.py::test_external_session_status_event_lands_in_status_cache
++   15.1 MB  (now    195.2 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_publishes_session_status
++    8.7 MB  (now    204.5 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_idle_forwards_persisted_assistant_output
++    0.6 MB  (now    205.6 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_propagates_runner_delivery_failure
++    0.4 MB  (now    195.6 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_failed_surfaces_output_and_reauth
++    0.3 MB  (now    204.9 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_failed_forwards_persisted_assistant_output
++    0.2 MB  (now    195.9 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_carries_response_id
++    0.1 MB  (now    205.0 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_failed_keeps_wire_output_and_codex_code
++    0.1 MB  (now    205.7 MB)  tests/server/integration/test_sessions_endpoints.py::test_post_external_session_status_rejects_unknown_status
+9 passed, 262 deselected in 4.56s

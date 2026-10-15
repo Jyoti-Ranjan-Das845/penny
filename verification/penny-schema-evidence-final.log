@@ -1,0 +1,35 @@
+2026-09-18T07:43:22.330599Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 731 items in this shard
+........................................................................ [  9%]
+........................................................................ [ 19%]
+........................................................................ [ 29%]
+........................................................................ [ 39%]
+........................................................................ [ 49%]
+........................................................................ [ 59%]
+........................................................................ [ 68%]
+........................................................................ [ 78%]
+........................................................................ [ 88%]
+..................................................................... [ 98%]
+..............                                                           [100%]
+========================= Top tests by peak-RSS delta ==========================
++  120.1 MB  (now    120.1 MB)  tests/spec/test_debby_example.py::test_debby_gpt_head_uses_codex_not_openai_agents
++    6.1 MB  (now    134.7 MB)  tests/inner/test_loader.py::test_load_agent_def_enforce_rejects_unregistered_handler
++    1.0 MB  (now    121.1 MB)  tests/spec/test_executor_fallbacks.py::test_bundle_load_retains_order_and_reasoning
++    0.6 MB  (now    126.8 MB)  tests/spec/test_resolve_agent_contract.py::test_resolve_agent_bounds_local_validation
++    0.2 MB  (now    127.0 MB)  tests/spec/test_resolve_agent_contract.py::test_resolve_agent_stages_the_ci_bundle_inside_the_worktree
++    0.1 MB  (now    125.4 MB)  tests/spec/test_parser.py::test_parse_credential_proxy_all_four_types
++    0.1 MB  (now    125.5 MB)  tests/spec/test_parser.py::test_parse_credential_proxy_databricks_cli_fail_loud[entry0-'default' 'b' must be one of 'profiles']
++    0.1 MB  (now    121.5 MB)  tests/spec/test_load.py::test_load_from_tarball
++    0.1 MB  (now    124.5 MB)  tests/spec/test_parser.py::test_parse_os_env_sandbox_mask_paths_validation[empty_entry]
++    0.1 MB  (now    135.0 MB)  tests/test_codex_failure_evidence.py::test_real_forwarder_posts_safe_failure_metadata[error]
++    0.1 MB  (now    122.8 MB)  tests/spec/test_omnigent_legacy_shim.py::test_shim_builds_usable_FunctionPolicy_through_spec_factory
++    0.1 MB  (now    123.1 MB)  tests/spec/test_otto_agent_permissions.py::test_repro_agent_fully_bypasses_sdk_permission_prompts
++    0.0 MB  (now    121.9 MB)  tests/spec/test_omnigent_adapter.py::test_agent_def_to_agent_spec_executor_block
++    0.0 MB  (now    121.9 MB)  tests/spec/test_omnigent_adapter.py::test_agent_def_to_agent_spec_function_tool
++    0.0 MB  (now    122.0 MB)  tests/spec/test_omnigent_adapter.py::test_load_omnigent_yaml_missing_package_raises_with_install_hint
++    0.0 MB  (now    122.1 MB)  tests/spec/test_omnigent_adapter.py::test_load_cancellable_function_yaml_rejected_post_step_c
++    0.0 MB  (now    122.2 MB)  tests/spec/test_omnigent_adapter.py::test_instructions_yaml_loads_through_full_pipeline
++    0.0 MB  (now    122.3 MB)  tests/spec/test_omnigent_adapter.py::test_harness_auto_pick_doesnt_override_explicit_declaration
++    0.0 MB  (now    123.0 MB)  tests/spec/test_omnigent_translator.py::test_server_runtime_tool_with_no_path_rejected
++    0.0 MB  (now    123.7 MB)  tests/spec/test_parser.py::test_discover_host_skills_skips_invalid_yaml_frontmatter
+731 passed, 3 subtests passed in 2.26s

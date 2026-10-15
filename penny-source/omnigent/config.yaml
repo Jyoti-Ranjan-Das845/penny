@@ -1,0 +1,35 @@
+spec_version: 1
+name: penny
+description: >-
+  Writing assistant with independent review and ordered model backups: assess,
+  challenge, and review messages, documents, and generic writing lessons.
+  Plain language, accurate meaning, and your voice come first.
+executor:
+  type: omnigent
+  model: gpt-6-astra
+  reasoning_effort: xhigh
+  fallbacks:
+    - model: claude-fable-5-1
+      harness: claude-native
+      reasoning_effort: max
+    - model: claude-opus-5
+      harness: claude-native
+      reasoning_effort: max
+  config:
+    harness: codex-native
+    yolo: false
+instructions: AGENTS.md
+skills: none
+async: true
+cancellable: true
+tools:
+  agents:
+    - intent
+    - curator
+    - reader
+    - applier
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none

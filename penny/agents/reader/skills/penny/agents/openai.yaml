@@ -1,0 +1,4 @@
+interface:
+  display_name: "Penny"
+  short_description: "Intent-led writing for messages and working documents"
+  default_prompt: "Use $penny to understand what this needs to accomplish, then help me write it clearly in my own voice."

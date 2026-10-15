@@ -1,0 +1,16 @@
+2026-09-18T07:46:33.645920Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 28 items in this shard
+............................                                             [100%]
+========================= Top tests by peak-RSS delta ==========================
++  119.2 MB  (now    119.2 MB)  tests/test_codex_native.py::test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history
++    1.5 MB  (now    121.1 MB)  tests/test_claude_native.py::test_ensure_local_claude_resume_transcript_marks_unresolvable_attachment
++    0.3 MB  (now    119.6 MB)  tests/test_claude_native.py::test_fetch_resume_items_retries_smaller_pages_on_5xx
++    0.0 MB  (now    119.3 MB)  tests/test_codex_native.py::test_ensure_local_codex_resume_rollout_rejects_malformed_tool_history[bad_item0-function_call 'fc_bad' has non-string arguments]
++    0.0 MB  (now    121.2 MB)  tests/test_claude_native.py::test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image
++    0.0 MB  (now    119.2 MB)  tests/test_codex_native.py::test_ensure_local_codex_resume_rollout_preserves_existing_rollout
++    0.0 MB  (now    119.3 MB)  tests/test_claude_native.py::test_ensure_local_claude_resume_transcript_uses_workspace_dir
++    0.0 MB  (now    119.3 MB)  tests/test_claude_native.py::test_ensure_local_claude_resume_transcript_returns_none_when_no_records
++    0.0 MB  (now    119.7 MB)  tests/test_claude_native.py::test_fetch_resume_items_retries_smaller_pages_on_dropped_connection
++    0.0 MB  (now    119.7 MB)  tests/test_claude_native.py::test_ensure_local_claude_resume_transcript_rematerializes_image_blocks
++    0.0 MB  (now    121.2 MB)  tests/test_claude_native.py::test_resolve_cold_resume_args_warning_lands_in_logger
+28 passed, 573 deselected in 0.35s

@@ -1,0 +1,21 @@
+2026-09-18T07:52:05.219768Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 32 items in this shard
+................................                                         [100%]
+========================= Top tests by peak-RSS delta ==========================
++  103.3 MB  (now    103.3 MB)  tests/test_claude_failure_evidence.py::test_evidence_matches_real_first_assistant_response_identity
++    0.5 MB  (now    104.0 MB)  tests/test_claude_failure_evidence.py::test_real_transcript_and_stopfailure_forwarding_propagates_only_safe_evidence[False]
++    0.1 MB  (now    104.1 MB)  tests/test_claude_failure_evidence.py::test_real_transcript_and_stopfailure_forwarding_propagates_only_safe_evidence[True]
++    0.0 MB  (now    103.5 MB)  tests/test_claude_failure_evidence.py::test_incomplete_or_malformed_transcript_never_proves_no_work[null\n]
++    0.0 MB  (now    103.3 MB)  tests/test_claude_failure_evidence.py::test_nonavailability_error_never_allows_replay[unknown]
++    0.0 MB  (now    103.3 MB)  tests/test_claude_failure_evidence.py::test_nonavailability_error_never_allows_replay[None]
++    0.0 MB  (now    103.3 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[ordinary_assistant]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[reasoning]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[tool_result]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[malformed]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[wrong_parent]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[wrong_session]
++    0.0 MB  (now    103.4 MB)  tests/test_claude_failure_evidence.py::test_work_or_ambiguous_turn_never_allows_replay[meta_user]
++    0.0 MB  (now    103.5 MB)  tests/test_claude_failure_evidence.py::test_other_response_identity_cannot_authorize_replay[resp_claude_c6c289e49e9c05b2145860387b73bcb1]
++    0.0 MB  (now    103.5 MB)  tests/test_claude_failure_evidence.py::test_other_response_identity_cannot_authorize_replay[resp_claude_ab1a60f436d03de94b0cbff049baa2aa]
++    0.0 MB  (now    103.5 MB)  tests/test_claude_failure_evidence.py::test_hook_message_requires_exact_proven_api_error_text
+32 passed in 0.10s

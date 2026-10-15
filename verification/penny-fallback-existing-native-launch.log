@@ -1,0 +1,11 @@
+2026-09-18T07:46:33.103588Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 29 items in this shard
+.............................                                            [100%]
+========================= Top tests by peak-RSS delta ==========================
++  136.8 MB  (now    136.8 MB)  tests/runner/test_codex_native_launch_config.py::test_missing_client_raises
++    2.9 MB  (now    139.7 MB)  tests/runner/test_native_subagent_status_laundering.py::test_trailing_idle_must_not_launder_failed_child_status
++    0.8 MB  (now    140.5 MB)  tests/runner/test_native_subagent_status_laundering.py::test_late_failed_report_must_not_be_discarded_by_delivered_completed
++    0.7 MB  (now    141.2 MB)  tests/runner/test_native_subagent_status_laundering.py::test_reaped_dispatch_wakes_parent_not_just_inbox
++    0.0 MB  (now    136.8 MB)  tests/runner/test_codex_native_launch_config.py::test_non_200_raises
++    0.0 MB  (now    136.8 MB)  tests/runner/test_app_native_startup_instructions.py::test_native_startup_raw_instructions_from_spec_never_returns_stripped_form
+29 passed in 0.17s

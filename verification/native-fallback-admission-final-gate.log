@@ -1,0 +1,9 @@
+2026-09-18T08:07:45.734287Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 15 items in this shard
+...............                                                          [100%]
+========================= Top tests by peak-RSS delta ==========================
++  183.5 MB  (now    183.5 MB)  tests/server/integration/test_native_fallback.py::test_new_message_waits_until_fallback_transition_is_delivered[start-ack]
++   12.9 MB  (now    196.5 MB)  tests/server/integration/test_native_fallback.py::test_new_message_waits_until_fallback_transition_is_delivered[failure-delivery]
++    7.6 MB  (now    210.8 MB)  tests/server/integration/test_native_fallback.py::test_provider_failure_chain_has_one_terminal_delivery[3]
++    6.7 MB  (now    203.1 MB)  tests/server/integration/test_native_fallback.py::test_provider_failure_chain_has_one_terminal_delivery[1]
+15 passed in 32.71s

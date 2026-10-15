@@ -1,0 +1,33 @@
+{
+  "installed": true,
+  "restarted": true,
+  "server_version": {
+    "version": "0.13.0.dev0"
+  },
+  "penny_version": 4,
+  "penny_bundle_sha256": "b3e0df77a6cce51045d3b66489c78e160e729cda6d7db9febe9fdc9a1d1a2221",
+  "penny_description": "Writing assistant with independent review and ordered model backups: assess, challenge, and review messages, documents, and generic writing lessons. Plain language, accurate meaning, and your voice come first.",
+  "runtime_changed_files_verified": 36,
+  "unrelated_user_edits_preserved": 6,
+  "previous_artifact_preserved": true,
+  "conversation_records_unchanged_by_update": true,
+  "other_agents_unchanged": true,
+  "live_model_execution_verified": true,
+  "backup_directory_name": "penny-fallback-backup-2026-09-18",
+  "live_provider_outage_recovery_verified": false,
+  "live_smoke_test": {
+    "purpose": "Synthetic one-sentence writing request with one Reader review",
+    "session_id": "616b6046fcf042cd82fc09e5f4d84f59",
+    "status": "idle",
+    "lead_model": "gpt-6-astra",
+    "models_with_recorded_usage": [
+      "claude-fable-5-1",
+      "gpt-6-astra"
+    ],
+    "reader_completion_observed": true,
+    "final_text": "We’ve finished the review and will send the summary on Friday.",
+    "host_online": true
+  },
+  "ui_new_penny_description_verified": true,
+  "verification_scope": "Normal live Lead/Reader execution passed. Automatic failover verified through controlled provider-failure tests, not an induced live provider outage."
+}

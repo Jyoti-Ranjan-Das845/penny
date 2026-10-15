@@ -1,0 +1,16 @@
+2026-09-18T08:03:24.188601Z [info     ] structlog output capture disabled, no output directory specified [structlog_config.pytest]
+Running 8 items in this shard
+........                                                                 [100%]
+========================= Top tests by peak-RSS delta ==========================
++  156.5 MB  (now    156.5 MB)  tests/runner/test_native_fallback_runtime.py::test_native_chain_replays_original_input_once_per_backup[claude-native-codex-native]
++    1.8 MB  (now    158.3 MB)  tests/runner/test_native_fallback_runtime.py::test_native_chain_replays_original_input_once_per_backup[codex-native-claude-native]
++    0.9 MB  (now    159.9 MB)  tests/runner/test_native_fallback_runtime.py::test_abort_fences_started_token_and_cannot_stop_newer_input
++    0.6 MB  (now    158.9 MB)  tests/runner/test_native_fallback_runtime.py::test_failure_can_claim_before_native_injection_ack_finishes
++    0.0 MB  (now    158.9 MB)  tests/runner/test_native_fallback_runtime.py::test_new_input_invalidates_an_unstarted_claim
+================================== slow tests ==================================
+[slow] 1.91s tests/runner/test_native_fallback_runtime.py::test_abort_fences_started_token_and_cannot_stop_newer_input
+[slow] 1.67s tests/runner/test_native_fallback_runtime.py::test_native_chain_replays_original_input_once_per_backup[codex-native-claude-native]
+[slow] 1.29s tests/runner/test_native_fallback_runtime.py::test_native_chain_replays_original_input_once_per_backup[claude-native-codex-native]
+[slow] 1.13s tests/runner/test_native_fallback_runtime.py::test_waiting_input_survives_transition_abort_and_waits_for_cleanup
+[slow] 1.11s tests/runner/test_native_fallback_runtime.py::test_failure_can_claim_before_native_injection_ack_finishes
+8 passed in 66.56s (0:01:06)
